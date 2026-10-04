@@ -1,0 +1,17 @@
+[project]
+name = "kiln"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Nawaz Gafar", email = "nawaz@terracotta4u.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+kiln = "kiln:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
