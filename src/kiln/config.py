@@ -41,6 +41,10 @@ class Config:
     def runs_dir(self) -> Path:
         return self.kiln_dir / "runs"
 
+    @property
+    def worktrees_dir(self) -> Path:
+        return self.kiln_dir / "worktrees"
+
 
 def repo_root(start: Path | None = None) -> Path:
     cwd = start or Path.cwd()

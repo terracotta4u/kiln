@@ -10,6 +10,7 @@ from kiln.db import connect, migrate
 from kiln.errors import KilnError
 from kiln.models import Goal, Task, TaskStatus
 from kiln.roles.scout import run_scout
+from kiln.roles.worker import run_worker
 from kiln.tasks import (
     add_dependency,
     add_goal,
@@ -79,6 +80,35 @@ def scout(
             )
         typer.echo(f"\nnote #{outcome.note.id} on goal #{outcome.goal.id}")
         typer.echo(outcome.note.text)
+
+    _with_db(render)
+
+
+@app.command()
+def work(
+    task: int | None = typer.Option(
+        None,
+        "--task",
+        "-t",
+        help="Task to claim. Omit to take the next ready task.",
+    ),
+) -> None:
+    """Claim one ready task and run a worker in its own worktree."""
+
+    def render(config: Config, conn) -> None:
+        outcome = run_worker(conn, config, task_id=task, reporter=typer.echo)
+        typer.echo(
+            f"task #{outcome.task.id}  {outcome.task.status.value}  {outcome.task.branch}"
+        )
+        typer.echo(f"attempts  {outcome.task.attempts}/{outcome.task.max_attempts}")
+        if outcome.run.log_path:
+            typer.echo(f"log  {outcome.run.log_path}")
+        if outcome.summary:
+            typer.echo(f"\n{outcome.summary}")
+        if outcome.diffstat:
+            typer.echo(f"\n{outcome.diffstat}")
+        if outcome.failure:
+            raise KilnError(f"task #{outcome.task.id} is in review: {outcome.failure}")
 
     _with_db(render)
 

@@ -261,6 +261,51 @@ def set_task_status(conn: sqlite3.Connection, task_id: int, status: TaskStatus) 
     return require_task(conn, task_id)
 
 
+def release_claim(conn: sqlite3.Connection, task_id: int) -> Task:
+    """Return a claimed task to pending when setup fails before an attempt starts."""
+    require_task(conn, task_id)
+    conn.execute(
+        "UPDATE tasks SET status = ?, claimed_by = NULL, updated_at = ? WHERE id = ?",
+        (TaskStatus.pending.value, utc_now(), task_id),
+    )
+    record_event(conn, "task.released", f"released claim on task #{task_id}", task_id=task_id)
+    return require_task(conn, task_id)
+
+
+def start_attempt(conn: sqlite3.Connection, task_id: int, *, branch: str, worktree_path: str) -> Task:
+    require_task(conn, task_id)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = ?, attempts = attempts + 1, branch = ?, worktree_path = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (TaskStatus.running.value, branch, worktree_path, utc_now(), task_id),
+    )
+    task = require_task(conn, task_id)
+    record_event(
+        conn,
+        "task.attempt",
+        f"attempt {task.attempts}/{task.max_attempts} on {branch}",
+        task_id=task_id,
+    )
+    return task
+
+
+def fail_task(conn: sqlite3.Connection, task_id: int, reason: str) -> Task:
+    task = require_task(conn, task_id)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = ?, feedback = ?, claimed_by = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (TaskStatus.failed.value, reason, utc_now(), task_id),
+    )
+    record_event(conn, "task.status", f"{task.status.value} -> failed: {reason}", task_id=task_id)
+    return require_task(conn, task_id)
+
+
 def cancel_task(conn: sqlite3.Connection, task_id: int) -> Task:
     task = require_task(conn, task_id)
     if task.status in (TaskStatus.done, TaskStatus.cancelled):
