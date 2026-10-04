@@ -83,6 +83,27 @@ class Task:
 
 
 @dataclass(frozen=True)
+class Event:
+    id: int
+    ts: str
+    kind: str
+    task_id: int | None
+    run_id: int | None
+    message: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Event":
+        return cls(
+            id=row["id"],
+            ts=row["ts"],
+            kind=row["kind"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            message=row["message"],
+        )
+
+
+@dataclass(frozen=True)
 class Note:
     id: int
     goal_id: int

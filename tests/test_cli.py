@@ -100,9 +100,67 @@ def test_goal_and_task_flow(repo):
 
 
 def test_commands_require_init(repo):
-    result = runner.invoke(app, ["status"])
-    assert result.exit_code != 0
-    assert "kiln init" in result.output
+    for args in (["status"], ["log"], ["gc"], ["runs", "show", "1"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code != 0
+        assert "kiln init" in result.output
+
+
+def test_log_and_runs_show(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    empty = runner.invoke(app, ["log"])
+    assert empty.exit_code == 0, empty.output
+    assert "no events" in empty.output
+
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    assert runner.invoke(app, ["task", "add", "1", "Schema"]).exit_code == 0
+    logged = runner.invoke(app, ["log"])
+    assert logged.exit_code == 0, logged.output
+    assert logged.output.index("goal.created") < logged.output.index("task.created")
+    assert "task #1" in logged.output
+
+    latest = runner.invoke(app, ["log", "-n", "1"])
+    assert "task.created" in latest.output
+    assert "goal.created" not in latest.output
+
+    rejected = runner.invoke(app, ["log", "-n", "0"])
+    assert rejected.exit_code != 0
+    assert "limit" in rejected.output
+
+    from kiln.db import connect
+    from kiln.models import RunStatus
+    from kiln.runs import finish_run, start_run
+
+    config = load_config(repo)
+    conn = connect(config.db_path)
+    try:
+        run = start_run(conn, role="scout", model="composer-2.5")
+        log_path = config.runs_dir / f"{run.id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("".join(f"line {index}\n" for index in range(45)))
+        finish_run(
+            conn,
+            run.id,
+            status=RunStatus.succeeded,
+            exit_code=0,
+            log_path=str(log_path),
+            report={"summary": "readme exists"},
+        )
+    finally:
+        conn.close()
+
+    shown = runner.invoke(app, ["runs", "show", "1"])
+    assert shown.exit_code == 0, shown.output
+    assert "composer-2.5" in shown.output
+    assert "readme exists" in shown.output
+    assert "task        (none)" in shown.output
+    assert "... 5 earlier lines" in shown.output
+    assert "line 44" in shown.output
+    assert "line 0\n" not in shown.output
+
+    missing = runner.invoke(app, ["runs", "show", "9"])
+    assert missing.exit_code != 0
+    assert "no run with id 9" in missing.output
 
 
 def test_invalid_config_is_rejected(repo):

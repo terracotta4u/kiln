@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from kiln.config import Config
 from kiln.db import connect, migrate, record_event
 from kiln.errors import KilnError
+from kiln.gc import cleanup
 from kiln.models import Goal, GoalStatus
 from kiln.notes import list_notes
 from kiln.queue import drop_scout, enqueue_scout, pending_scouts
@@ -41,6 +42,7 @@ def run_tick(
         raise KilnError("workers must be >= 1")
 
     if dry_run:
+        result.lines.extend(cleanup(conn, config, dry_run=True))
         for goal in goals:
             result.lines.append(goal_brief(conn, config, goal))
             if _needs_auto_scout(conn, goal):
@@ -55,6 +57,7 @@ def run_tick(
             result.lines.append("dispatch skipped")
         return result
 
+    result.lines.extend(cleanup(conn, config))
     for goal in goals:
         _scout_goal(conn, config, goal, result, agent_bin=agent_bin, reporter=reporter)
     for goal in list_goals(conn, status=GoalStatus.active):

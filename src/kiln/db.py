@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kiln.errors import KilnError
+from kiln.models import Event
 
 SCHEMA_VERSION = 2
 
@@ -120,6 +121,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 2:
         conn.executescript(SCHEMA_V2)
         conn.execute("PRAGMA user_version = 2")
+
+
+def list_events(conn: sqlite3.Connection, *, limit: int) -> list[Event]:
+    if limit < 1:
+        raise KilnError("log limit must be >= 1")
+    rows = conn.execute(
+        "SELECT * FROM events ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [Event.from_row(row) for row in reversed(rows)]
 
 
 def record_event(

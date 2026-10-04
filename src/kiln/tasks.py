@@ -335,6 +335,28 @@ def fail_task(conn: sqlite3.Connection, task_id: int, reason: str) -> Task:
     return require_task(conn, task_id)
 
 
+def forget_checkout(
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    worktree: bool = False,
+    branch: bool = False,
+) -> None:
+    """Drop a stored worktree path or branch name after the checkout is gone."""
+    assignments: list[str] = []
+    if worktree:
+        assignments.append("worktree_path = NULL")
+    if branch:
+        assignments.append("branch = NULL")
+    if not assignments:
+        return
+    assignments.append("updated_at = ?")
+    conn.execute(
+        f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
+        (utc_now(), task_id),
+    )
+
+
 def cancel_task(conn: sqlite3.Connection, task_id: int) -> Task:
     task = require_task(conn, task_id)
     if task.status in (TaskStatus.done, TaskStatus.cancelled):

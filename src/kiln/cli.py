@@ -1,17 +1,21 @@
+import json
 from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 from typing import NoReturn
 
 import typer
 
 from kiln import __version__
 from kiln.config import Config, init_factory, load_config
-from kiln.db import connect, migrate
+from kiln.db import connect, list_events, migrate
 from kiln.errors import KilnError
-from kiln.models import Goal, Task, TaskStatus
+from kiln.gc import cleanup
+from kiln.models import Event, Goal, Run, Task, TaskStatus
 from kiln.review import approve_task, reject_task, send_back
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
+from kiln.runs import require_run
 from kiln.tick import run_tick
 from kiln.tasks import (
     add_dependency,
@@ -30,8 +34,10 @@ from kiln.tasks import (
 app = typer.Typer(no_args_is_help=True, help="Kiln: an automated software factory for one repo.")
 goal_app = typer.Typer(no_args_is_help=True, help="Manage goals.")
 task_app = typer.Typer(no_args_is_help=True, help="Manage tasks.")
+runs_app = typer.Typer(no_args_is_help=True, help="Inspect agent runs.")
 app.add_typer(goal_app, name="goal")
 app.add_typer(task_app, name="task")
+app.add_typer(runs_app, name="runs")
 
 
 def _version(value: bool) -> None:
@@ -163,6 +169,63 @@ def review(
             typer.echo(send_back(conn, task_id, rework))
         else:
             typer.echo(reject_task(conn, task_id, reason))
+
+    _with_db(render)
+
+
+@app.command()
+def log(
+    limit: int = typer.Option(20, "--limit", "-n", help="How many events to show."),
+) -> None:
+    """Show recent factory events, oldest first."""
+    if limit < 1:
+        _fail(KilnError("log limit must be >= 1"))
+
+    def render(_config: Config, conn) -> None:
+        events = list_events(conn, limit=limit)
+        if not events:
+            typer.echo("no events")
+            return
+        for event in events:
+            typer.echo(_format_event(event))
+
+    _with_db(render)
+
+
+@app.command()
+def gc() -> None:
+    """Remove worktrees and merged branches left behind by finished tasks."""
+
+    def render(config: Config, conn) -> None:
+        lines = cleanup(conn, config)
+        if not lines:
+            typer.echo("nothing to clean")
+            return
+        for line in lines:
+            typer.echo(line)
+
+    _with_db(render)
+
+
+@runs_app.command("show")
+def runs_show(run_id: int = typer.Argument(help="Run id.")) -> None:
+    """Show one agent run, its report, and the tail of its log."""
+
+    def render(_config: Config, conn) -> None:
+        run = require_run(conn, run_id)
+        typer.echo(f"run #{run.id}")
+        typer.echo(f"role        {run.role}")
+        typer.echo(f"model       {run.model}")
+        typer.echo(f"status      {run.status.value}")
+        typer.echo(f"task        {_format_task_ref(run)}")
+        typer.echo(f"exit        {_format_exit(run.exit_code)}")
+        typer.echo(f"started     {run.started_at}")
+        typer.echo(f"finished    {run.finished_at or '(still running)'}")
+        typer.echo(f"log         {run.log_path or '(none)'}")
+        typer.echo("\nreport")
+        typer.echo(_format_report(run))
+        typer.echo("\nlog")
+        typer.echo(_read_log_tail(run.log_path))
 
     _with_db(render)
 
@@ -403,6 +466,55 @@ def _echo_task_lines(tasks: list[Task]) -> None:
         return
     for task in tasks:
         typer.echo(f"  #{task.id}  {task.status.value:<9}  p{task.priority}  {task.title}")
+
+
+def _format_event(event: Event) -> str:
+    refs = []
+    if event.task_id is not None:
+        refs.append(f"task #{event.task_id}")
+    if event.run_id is not None:
+        refs.append(f"run #{event.run_id}")
+    prefix = f"{event.ts}  {event.kind}"
+    if refs:
+        prefix += "  " + "  ".join(refs)
+    message = " ".join(event.message.split())
+    return f"{prefix}  {message}"
+
+
+def _format_task_ref(run: Run) -> str:
+    if run.task_id is None:
+        return "(none)"
+    return f"#{run.task_id}"
+
+
+def _format_exit(exit_code: int | None) -> str:
+    if exit_code is None:
+        return "(none)"
+    return str(exit_code)
+
+
+def _format_report(run: Run) -> str:
+    if not run.report_json:
+        return "(none)"
+    try:
+        parsed = json.loads(run.report_json)
+    except json.JSONDecodeError:
+        return run.report_json
+    return json.dumps(parsed, indent=2)
+
+
+def _read_log_tail(log_path: str | None, *, lines: int = 40) -> str:
+    if not log_path:
+        return "(none)"
+    path = Path(log_path)
+    if not path.is_file():
+        return f"(missing) {path}"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    parts = text.splitlines()
+    if len(parts) <= lines:
+        return text.rstrip("\n") or "(empty)"
+    omitted = len(parts) - lines
+    return f"... {omitted} earlier lines\n" + "\n".join(parts[-lines:])
 
 
 def _format_related(tasks: list[Task]) -> str:

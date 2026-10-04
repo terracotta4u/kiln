@@ -38,6 +38,15 @@ def remove_worktree(repo: Path, worktree: Path) -> None:
     _git(repo, "worktree", "remove", "--force", str(worktree))
 
 
+def prune_worktrees(repo: Path) -> str:
+    result = _git(repo, "worktree", "prune", "-v")
+    return result.stdout.strip()
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    return _branch_exists(repo, branch)
+
+
 def delete_branch(repo: Path, branch: str) -> None:
     _git(repo, "branch", "-D", branch)
 
