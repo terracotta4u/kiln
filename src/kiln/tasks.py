@@ -40,6 +40,13 @@ def get_goal(conn: sqlite3.Connection, goal_id: int) -> Goal | None:
     return Goal.from_row(row) if row else None
 
 
+def set_goal_status(conn: sqlite3.Connection, goal_id: int, status: GoalStatus) -> Goal:
+    goal = require_goal(conn, goal_id)
+    conn.execute("UPDATE goals SET status = ? WHERE id = ?", (status.value, goal_id))
+    record_event(conn, "goal.status", f"goal #{goal_id} {goal.status.value} -> {status.value}")
+    return require_goal(conn, goal_id)
+
+
 def require_goal(conn: sqlite3.Connection, goal_id: int) -> Goal:
     goal = get_goal(conn, goal_id)
     if goal is None:
@@ -290,6 +297,28 @@ def start_attempt(conn: sqlite3.Connection, task_id: int, *, branch: str, worktr
         task_id=task_id,
     )
     return task
+
+
+def rework_task(conn: sqlite3.Connection, task_id: int, feedback: str) -> Task:
+    """Send a reviewed task back to pending with feedback. Exhausted tasks fail."""
+    task = require_task(conn, task_id)
+    if task.status != TaskStatus.review:
+        raise KilnError(f"task #{task_id} is {task.status.value}; only a task in review can be reworked")
+    cleaned = feedback.strip()
+    if not cleaned:
+        raise KilnError("rework feedback cannot be empty")
+    if task.attempts >= task.max_attempts:
+        return fail_task(conn, task_id, cleaned)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = ?, feedback = ?, claimed_by = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (TaskStatus.pending.value, cleaned, utc_now(), task_id),
+    )
+    record_event(conn, "task.rework", cleaned, task_id=task_id)
+    return require_task(conn, task_id)
 
 
 def fail_task(conn: sqlite3.Connection, task_id: int, reason: str) -> Task:

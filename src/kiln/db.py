@@ -4,7 +4,7 @@ from pathlib import Path
 
 from kiln.errors import KilnError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1 = """
 CREATE TABLE goals (
@@ -70,10 +70,26 @@ CREATE TABLE events (
     message TEXT NOT NULL
 );
 
+CREATE TABLE scout_requests (
+    id INTEGER PRIMARY KEY,
+    goal_id INTEGER NOT NULL REFERENCES goals(id),
+    question TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX idx_tasks_goal ON tasks(goal_id);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_task_deps_depends_on ON task_deps(depends_on);
 CREATE INDEX idx_events_ts ON events(ts);
+"""
+
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS scout_requests (
+    id INTEGER PRIMARY KEY,
+    goal_id INTEGER NOT NULL REFERENCES goals(id),
+    question TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -99,7 +115,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
     if version < 1:
         conn.executescript(SCHEMA_V1)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 1")
+        version = 1
+    if version < 2:
+        conn.executescript(SCHEMA_V2)
+        conn.execute("PRAGMA user_version = 2")
 
 
 def record_event(

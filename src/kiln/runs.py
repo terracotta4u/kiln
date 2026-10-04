@@ -54,6 +54,14 @@ def finish_run(
     return require_run(conn, run_id)
 
 
+def latest_run(conn: sqlite3.Connection, task_id: int, role: str) -> Run | None:
+    row = conn.execute(
+        "SELECT * FROM runs WHERE task_id = ? AND role = ? ORDER BY id DESC LIMIT 1",
+        (task_id, role),
+    ).fetchone()
+    return Run.from_row(row) if row else None
+
+
 def get_run(conn: sqlite3.Connection, run_id: int) -> Run | None:
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     return Run.from_row(row) if row else None

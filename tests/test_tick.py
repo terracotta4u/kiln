@@ -1,0 +1,274 @@
+import json
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from kiln.cli import app
+from kiln.config import init_factory, load_config
+from kiln.db import connect
+from kiln.models import GoalStatus, TaskStatus
+from kiln.notes import list_notes
+from kiln.queue import pending_scouts
+from kiln.roles.worker import run_worker
+from kiln.review import approve_task
+from kiln.tasks import add_goal, add_task, get_task, list_tasks
+from kiln.tick import run_tick
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "kiln@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Kiln"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    monkeypatch.chdir(tmp_path)
+    init_factory(tmp_path)
+    return tmp_path
+
+
+def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
+    script = _agent(factory, _smart_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it", "Add a marker file")
+        first = run_tick(conn, config, agent_bin=str(script))
+        task = list_tasks(conn)[0]
+        on_main_after_work = (factory / "marker.txt").exists()
+        second = run_tick(conn, config, agent_bin=str(script))
+        stored = get_task(conn, task.id)
+        goal = get_goal_row(conn)
+    finally:
+        conn.close()
+
+    assert any("scout note" in line for line in first.lines)
+    assert any("created task #1" in line for line in first.lines)
+    assert task.status == TaskStatus.review
+    assert on_main_after_work is False
+    assert stored is not None
+    assert stored.status == TaskStatus.done
+    assert (factory / "marker.txt").read_text() == "ok\n"
+    assert any("merged into main" in line for line in second.lines)
+    assert not (factory / ".kiln" / "worktrees" / "1").exists()
+    missing = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/kiln/1-add-marker"],
+        cwd=factory,
+    )
+    assert missing.returncode != 0
+    assert goal == GoalStatus.active
+
+
+def test_conflict_sends_the_task_back_for_rework(factory: Path):
+    script = _agent(
+        factory,
+        "from pathlib import Path\n"
+        "Path('README.md').write_text('worker\\n')\n"
+        + _emit({"summary": "edited readme", "files": ["README.md"]}),
+    )
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        task = add_task(conn, goal.id, "Edit readme")
+        run_worker(conn, config, task_id=task.id, agent_bin=str(script))
+        (factory / "README.md").write_text("main\n")
+        subprocess.run(["git", "commit", "-am", "main edit"], cwd=factory, check=True, capture_output=True)
+        message = approve_task(conn, config, task.id)
+        stored = get_task(conn, task.id)
+    finally:
+        conn.close()
+
+    assert "rework" in message
+    assert stored is not None
+    assert stored.status == TaskStatus.pending
+    assert stored.feedback is not None and "conflicted" in stored.feedback
+    assert (factory / "README.md").read_text() == "main\n"
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{stored.branch}"],
+        cwd=factory,
+    ).returncode == 0
+
+
+def test_queued_scout_runs_on_the_next_tick(factory: Path):
+    script = _agent(factory, _queue_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        add_task(conn, goal.id, "Existing")
+        first = run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        queued = pending_scouts(conn, goal.id)
+        notes_after_first = list_notes(conn, goal.id)
+        run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        notes = list_notes(conn, goal.id)
+        queued_after = pending_scouts(conn, goal.id)
+    finally:
+        conn.close()
+
+    assert any("queued scout" in line for line in first.lines)
+    assert queued and queued[0][1] == "scout-me please"
+    assert notes_after_first == []
+    assert queued_after == []
+    assert notes and "scout-me please" in notes[0].text
+
+
+def test_dry_run_changes_nothing(factory: Path):
+    script = _agent(factory, "from pathlib import Path\nPath('agent-ran').write_text('x')\n")
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it", "A factory")
+        result = run_tick(conn, config, agent_bin=str(script), dry_run=True)
+        tasks = list_tasks(conn)
+    finally:
+        conn.close()
+
+    assert not (factory / "agent-ran").exists()
+    assert tasks == []
+    assert any("would scout" in line for line in result.lines)
+    assert any("would dispatch" in line for line in result.lines)
+
+
+def test_no_dispatch_leaves_the_task_pending(factory: Path):
+    script = _agent(factory, _smart_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it")
+        run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        tasks = list_tasks(conn)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 1
+    assert tasks[0].status == TaskStatus.pending
+    assert not (factory / ".kiln" / "worktrees").exists()
+
+
+def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
+    script = _agent(factory, _smart_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        add_task(conn, goal.id, "First")
+        add_task(conn, goal.id, "Second")
+        run_tick(conn, config, workers=1, agent_bin=str(script))
+        tasks = list_tasks(conn)
+    finally:
+        conn.close()
+
+    statuses = sorted(task.status for task in tasks)
+    assert statuses == [TaskStatus.pending, TaskStatus.review]
+
+
+def test_two_workers_run_together(factory: Path):
+    script = _agent(factory, _smart_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        add_task(conn, goal.id, "First")
+        add_task(conn, goal.id, "Second")
+        run_tick(conn, config, workers=2, agent_bin=str(script))
+        tasks = list_tasks(conn)
+    finally:
+        conn.close()
+
+    assert [task.status for task in tasks] == [TaskStatus.review, TaskStatus.review]
+
+
+def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
+    script = _agent(
+        factory,
+        "from pathlib import Path\n"
+        "Path('marker.txt').write_text('ok\\n')\n"
+        + _emit({"summary": "added marker", "files": ["marker.txt"]}),
+    )
+    monkeypatch.setenv("KILN_AGENT_BIN", str(script))
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    assert runner.invoke(app, ["task", "add", "1", "Add marker"]).exit_code == 0
+    worked = runner.invoke(app, ["work"])
+    assert worked.exit_code == 0, worked.output
+    approved = runner.invoke(app, ["review", "1", "--approve"])
+    assert approved.exit_code == 0, approved.output
+    assert "merged into main" in approved.output
+    assert (factory / "marker.txt").read_text() == "ok\n"
+
+
+def _smart_agent() -> str:
+    return f"""
+import json, sys
+from pathlib import Path
+prompt = sys.argv[-1]
+if "You are a scout" in prompt:
+    {_emit_call('{"summary": "repo has a readme", "findings": ["README.md"]}')}
+elif "You are the Kiln foreman" in prompt:
+    if "[review]" in prompt:
+        {_emit_call('{"actions": [{"type": "approve", "task_id": 1}]}')}
+    elif "Tasks:\\n(none)" in prompt:
+        {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}]}')}
+    else:
+        {_emit_call('{"actions": []}')}
+else:
+    Path("marker.txt").write_text("ok\\n")
+    {_emit_call('{"summary": "added marker", "files": ["marker.txt"]}')}
+"""
+
+
+def _queue_agent() -> str:
+    return f"""
+import sys
+prompt = sys.argv[-1]
+if "You are a scout" in prompt:
+    {_emit_call('{"summary": "answered", "findings": []}')}
+elif "You are the Kiln foreman" in prompt:
+    if "scout-me please" in prompt:
+        {_emit_call('{"actions": []}')}
+    else:
+        {_emit_call('{"actions": [{"type": "request_scout", "question": "scout-me please"}]}')}
+else:
+    {_emit_call('{"summary": "worker", "files": []}')}
+"""
+
+
+def _emit_call(payload: str) -> str:
+    return "print(" + json.dumps(_envelope(payload)) + ")"
+
+
+def _emit(payload: dict) -> str:
+    return "print(" + json.dumps(_envelope(json.dumps(payload))) + ")\n"
+
+
+def _envelope(result_body: str) -> str:
+    if not result_body.startswith("{"):
+        body = result_body
+    else:
+        body = result_body
+    report = body if body.startswith("{") else body
+    # result_body is already a JSON object string.
+    text = "```json\n" + report + "\n```"
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
+
+
+def _agent(directory: Path, body: str) -> Path:
+    path = directory / "fake-agent"
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
+def get_goal_row(conn):
+    from kiln.tasks import list_goals
+
+    return list_goals(conn)[0].status

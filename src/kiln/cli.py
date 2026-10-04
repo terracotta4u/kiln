@@ -9,8 +9,10 @@ from kiln.config import Config, init_factory, load_config
 from kiln.db import connect, migrate
 from kiln.errors import KilnError
 from kiln.models import Goal, Task, TaskStatus
+from kiln.review import approve_task, reject_task, send_back
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
+from kiln.tick import run_tick
 from kiln.tasks import (
     add_dependency,
     add_goal,
@@ -109,6 +111,58 @@ def work(
             typer.echo(f"\n{outcome.diffstat}")
         if outcome.failure:
             raise KilnError(f"task #{outcome.task.id} is in review: {outcome.failure}")
+
+    _with_db(render)
+
+
+@app.command()
+def run(
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
+        "-w",
+        help="How many workers to dispatch. Defaults to max_parallel_workers in kiln.toml.",
+    ),
+    no_dispatch: bool = typer.Option(False, "--no-dispatch", help="Do not start workers."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the tick and change nothing."),
+) -> None:
+    """Run one factory tick: scout, foreman, merge, then workers."""
+
+    def render(config: Config, conn) -> None:
+        outcome = run_tick(
+            conn,
+            config,
+            workers=workers,
+            dispatch=not no_dispatch,
+            dry_run=dry_run,
+            reporter=typer.echo,
+        )
+        for line in outcome.lines:
+            typer.echo(line)
+
+    _with_db(render)
+
+
+@app.command()
+def review(
+    task_id: int = typer.Argument(help="Task in review."),
+    approve: bool = typer.Option(False, "--approve", help="Merge the task branch into the base branch."),
+    rework: str | None = typer.Option(None, "--rework", help="Send the task back with this feedback."),
+    fail: bool = typer.Option(False, "--fail", help="Fail the task."),
+    reason: str = typer.Option("", "--reason", help="Why the task failed."),
+) -> None:
+    """Approve, rework, or fail a task that is in review."""
+    chosen = sum((approve, rework is not None, fail))
+    if chosen != 1:
+        _fail(KilnError("pass exactly one of --approve, --rework, or --fail"))
+
+    def render(config: Config, conn) -> None:
+        if approve:
+            typer.echo(approve_task(conn, config, task_id))
+        elif rework is not None:
+            typer.echo(send_back(conn, task_id, rework))
+        else:
+            typer.echo(reject_task(conn, task_id, reason))
 
     _with_db(render)
 

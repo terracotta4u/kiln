@@ -27,7 +27,27 @@ def conn(tmp_path):
 
 def test_migrate_is_idempotent(conn):
     migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_migrate_upgrades_a_v1_database(tmp_path):
+    connection = connect(tmp_path / "kiln.db")
+    connection.executescript(
+        """
+        CREATE TABLE goals (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.execute("PRAGMA user_version = 1")
+    migrate(connection)
+    connection.execute("SELECT 1 FROM scout_requests")
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    connection.close()
 
 
 def test_ready_set_respects_dependencies_and_status(conn):
