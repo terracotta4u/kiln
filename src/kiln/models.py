@@ -83,6 +83,23 @@ class Task:
 
 
 @dataclass(frozen=True)
+class Note:
+    id: int
+    goal_id: int
+    text: str
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Note":
+        return cls(
+            id=row["id"],
+            goal_id=row["goal_id"],
+            text=row["text"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass(frozen=True)
 class Run:
     id: int
     task_id: int | None

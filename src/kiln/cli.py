@@ -9,6 +9,7 @@ from kiln.config import Config, init_factory, load_config
 from kiln.db import connect, migrate
 from kiln.errors import KilnError
 from kiln.models import Goal, Task, TaskStatus
+from kiln.roles.scout import run_scout
 from kiln.tasks import (
     add_dependency,
     add_goal,
@@ -61,6 +62,25 @@ def init() -> None:
     else:
         typer.echo(f"{config.toml_path} already exists; left unchanged")
     typer.echo(f"database {config.db_path}")
+
+
+@app.command()
+def scout(
+    question: str = typer.Argument(help="What the scout should find out."),
+    goal: int | None = typer.Option(None, "--goal", "-g", help="Goal to attach the report to."),
+) -> None:
+    """Send a read-only scout and store its report as a note."""
+
+    def render(config: Config, conn) -> None:
+        outcome = run_scout(conn, config, question, goal_id=goal, reporter=typer.echo)
+        if outcome.note is None:
+            raise KilnError(
+                f"scout failed: {outcome.failure} (run #{outcome.run.id}, log {outcome.run.log_path})"
+            )
+        typer.echo(f"\nnote #{outcome.note.id} on goal #{outcome.goal.id}")
+        typer.echo(outcome.note.text)
+
+    _with_db(render)
 
 
 @app.command()
