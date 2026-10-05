@@ -12,7 +12,6 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.models import GoalStatus, TaskStatus
 from kiln.notes import list_notes
-from kiln.queue import pending_scouts
 from kiln.roles.worker import run_worker
 from kiln.review import approve_task
 from kiln.tasks import add_goal, add_task, get_task, list_tasks
@@ -49,8 +48,8 @@ def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
     finally:
         conn.close()
 
-    assert any("scout note" in line for line in first.lines)
     assert any("created task #1" in line for line in first.lines)
+    assert any("task #1  review" in line for line in first.lines)
     assert task.status == TaskStatus.review
     assert on_main_after_work is False
     assert stored is not None
@@ -118,7 +117,7 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
     ).returncode == 0
 
 
-def test_queued_scout_runs_on_the_next_tick(factory: Path):
+def test_scout_action_runs_during_the_tick(factory: Path):
     script = _agent(factory, _queue_agent())
     config = load_config(factory)
     conn = connect(config.db_path)
@@ -126,19 +125,16 @@ def test_queued_scout_runs_on_the_next_tick(factory: Path):
         goal = add_goal(conn, "Ship it")
         add_task(conn, goal.id, "Existing")
         first = run_tick(conn, config, agent_bin=str(script), dispatch=False)
-        queued = pending_scouts(conn, goal.id)
         notes_after_first = list_notes(conn, goal.id)
-        run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        second = run_tick(conn, config, agent_bin=str(script), dispatch=False)
         notes = list_notes(conn, goal.id)
-        queued_after = pending_scouts(conn, goal.id)
     finally:
         conn.close()
 
-    assert any("queued scout" in line for line in first.lines)
-    assert queued and queued[0][1] == "scout-me please"
-    assert notes_after_first == []
-    assert queued_after == []
-    assert notes and "scout-me please" in notes[0].text
+    assert any("scout note" in line for line in first.lines)
+    assert notes_after_first and "scout-me please" in notes_after_first[0].text
+    assert len(notes) == 1
+    assert any("no actions" in line for line in second.lines)
 
 
 def test_dry_run_changes_nothing(factory: Path):
@@ -154,8 +150,8 @@ def test_dry_run_changes_nothing(factory: Path):
 
     assert not (factory / "agent-ran").exists()
     assert tasks == []
-    assert any("would scout" in line for line in result.lines)
-    assert any("would dispatch" in line for line in result.lines)
+    assert any("Ship it" in line for line in result.lines)
+    assert any("would create branch" in line for line in result.lines)
 
 
 def test_no_dispatch_leaves_the_task_pending(factory: Path):
@@ -295,7 +291,9 @@ elif "You are the Kiln foreman" in prompt:
     if "[review]" in prompt:
         {_emit_call('{"actions": [{"type": "approve", "task_id": 1}]}')}
     elif "Tasks:\\n(none)" in prompt:
-        {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}]}')}
+        {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}, {"type": "dispatch", "ref": "marker"}]}')}
+    elif "[pending]" in prompt:
+        {_emit_call('{"actions": [{"type": "dispatch", "task_id": 1}, {"type": "dispatch", "task_id": 2}]}')}
     else:
         {_emit_call('{"actions": []}')}
 else:
@@ -314,7 +312,7 @@ elif "You are the Kiln foreman" in prompt:
     if "scout-me please" in prompt:
         {_emit_call('{"actions": []}')}
     else:
-        {_emit_call('{"actions": [{"type": "request_scout", "question": "scout-me please"}]}')}
+        {_emit_call('{"actions": [{"type": "scout", "question": "scout-me please"}]}')}
 else:
     {_emit_call('{"summary": "worker", "files": []}')}
 """

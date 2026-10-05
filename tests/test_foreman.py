@@ -1,8 +1,15 @@
 from kiln.db import connect, migrate
 from kiln.models import GoalStatus, TaskStatus
-from kiln.queue import pending_scouts
-from kiln.roles.foreman import apply_actions
-from kiln.tasks import add_goal, add_task, get_task, list_tasks, set_task_status
+from kiln.roles.foreman import apply_actions, goal_brief
+from kiln.tasks import (
+    add_dependency,
+    add_goal,
+    add_task,
+    get_task,
+    list_tasks,
+    require_goal,
+    set_task_status,
+)
 
 
 def test_apply_creates_a_dependency_chain(tmp_path):
@@ -39,7 +46,7 @@ def test_apply_creates_a_dependency_chain(tmp_path):
     conn.close()
 
 
-def test_apply_notes_scouts_cancel_and_goal_done(tmp_path):
+def test_apply_notes_brief_and_goal_done(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
     task = add_task(conn, goal.id, "Schema")
@@ -49,18 +56,21 @@ def test_apply_notes_scouts_cancel_and_goal_done(tmp_path):
         goal,
         [
             {"type": "note", "text": "looked around"},
-            {"type": "request_scout", "question": "Where is the CLI?"},
+            {"type": "update_brief", "text": "Success: the schema exists."},
             {"type": "cancel", "task_id": task.id},
             {"type": "goal_done"},
+            {"type": "goal_done", "evidence": ["schema task was cancelled"]},
             {"type": "frobnicate"},
         ],
     )
-    assert any(message.startswith("note #") for message in messages)
-    assert pending_scouts(conn, goal.id) == [(1, "Where is the CLI?")]
     stored = get_task(conn, task.id)
+    finished = require_goal(conn, goal.id)
+    assert any(message.startswith("note #") for message in messages)
     assert stored is not None and stored.status == TaskStatus.cancelled
-    assert any("done" in message for message in messages)
-    assert get_goal_status(conn, goal.id) == GoalStatus.done
+    assert finished.brief == "Success: the schema exists."
+    assert any("requires evidence" in message for message in messages)
+    assert finished.status == GoalStatus.done
+    assert finished.evidence == ("schema task was cancelled",)
     assert any("unknown action" in message for message in messages)
     conn.close()
 
@@ -69,9 +79,60 @@ def test_goal_done_waits_for_open_tasks(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
     add_task(conn, goal.id, "Schema")
-    messages = apply_actions(conn, _config(), goal, [{"type": "goal_done"}])
+    messages = apply_actions(
+        conn,
+        _config(),
+        goal,
+        [{"type": "goal_done", "evidence": ["not yet"]}],
+    )
     assert "open tasks" in messages[0]
     assert get_goal_status(conn, goal.id) == GoalStatus.active
+    assert require_goal(conn, goal.id).evidence is None
+    conn.close()
+
+
+def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
+    conn = _db(tmp_path)
+    goal = add_goal(conn, "Ship it")
+    first = add_task(conn, goal.id, "Schema")
+    second = add_task(conn, goal.id, "CLI")
+    add_dependency(conn, second.id, first.id)
+    limited = apply_actions(
+        conn,
+        _config(),
+        goal,
+        [
+            {"type": "dispatch", "task_id": first.id},
+            {"type": "dispatch", "task_id": second.id},
+        ],
+        worker_limit=0,
+    )
+    blocked = apply_actions(conn, _config(), goal, [{"type": "dispatch", "task_id": second.id}])
+    review = apply_actions(conn, _config(), goal, [{"type": "review", "task_id": first.id}])
+    assert limited == ["limit reached, dispatch next turn", "limit reached, dispatch next turn"]
+    assert "blocked" in blocked[0]
+    assert "only a task in review" in review[0]
+    assert [task.status for task in list_tasks(conn, goal_id=goal.id)] == [
+        TaskStatus.pending,
+        TaskStatus.pending,
+    ]
+    conn.close()
+
+
+def test_goal_brief_shows_the_brief_and_what_is_ready(tmp_path):
+    conn = _db(tmp_path)
+    goal = add_goal(conn, "Ship it")
+    from kiln.tasks import set_goal_brief
+
+    set_goal_brief(conn, goal.id, "Success: both tasks land.")
+    first = add_task(conn, goal.id, "Schema")
+    second = add_task(conn, goal.id, "CLI")
+    add_dependency(conn, second.id, first.id)
+    text = goal_brief(conn, _config(), require_goal(conn, goal.id))
+    assert "Success: both tasks land." in text
+    assert f"#{first.id} [pending] ready" in text
+    assert f"#{second.id} [pending] blocked by #{first.id}" in text
+    assert "Workers this turn: 2" in text
     conn.close()
 
 

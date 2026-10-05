@@ -17,12 +17,15 @@ Reply with one fenced JSON object and nothing after it:
 Each action is one of:
 
 {"type": "create_task", "ref": "short-name", "title": "...", "description": "...", "acceptance": "...", "depends_on": ["short-name"], "priority": 1}
-{"type": "request_scout", "question": "..."}
+{"type": "scout", "question": "..."}
+{"type": "dispatch", "task_id": 1}
+{"type": "review", "task_id": 1, "focus": "what to look at"}
 {"type": "approve", "task_id": 1}
 {"type": "rework", "task_id": 1, "feedback": "..."}
 {"type": "fail", "task_id": 1, "reason": "..."}
 {"type": "cancel", "task_id": 1}
 {"type": "note", "text": "..."}
-{"type": "goal_done"}
+{"type": "update_brief", "text": "..."}
+{"type": "goal_done", "evidence": ["what shows the goal is met"]}
 
-`ref` is a temporary name. Later `depends_on` entries in this same list, and existing task ids, can point at a task. Approve, rework, or fail only tasks whose status is review. A requested scout runs on the next tick. Use goal_done only when every task is finished. Leave `actions` empty when nothing should change.
+`ref` is a temporary name. Later actions in this same list can use it as `ref` or inside `depends_on`. Dispatch only a task marked ready. Review, approve, rework, or fail only a task in review. A scout's note shows up in the next state you see. `goal_done` needs evidence, and every task must be finished. Kiln scouts, dispatches, and reviews only when you ask. Leave `actions` empty when nothing should change.

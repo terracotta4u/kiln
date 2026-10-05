@@ -11,8 +11,10 @@ from kiln.git import diffstat, goal_branch_name
 from kiln.models import Goal, GoalStatus, Run, RunStatus, Task, TaskStatus
 from kiln.notes import add_note, list_notes
 from kiln.prompts import render_prompt
-from kiln.queue import enqueue_scout
 from kiln.review import approve_task, reject_task, send_back
+from kiln.roles.reviewer import run_reviewer
+from kiln.roles.scout import run_scout
+from kiln.roles.worker import run_worker
 from kiln.runs import finish_run, latest_run, start_run
 from kiln.tasks import (
     add_dependency,
@@ -21,7 +23,10 @@ from kiln.tasks import (
     dependencies,
     fail_task,
     list_tasks,
+    ready_tasks,
     require_task,
+    set_goal_brief,
+    set_goal_evidence,
     set_goal_status,
 )
 
@@ -36,22 +41,36 @@ class ForemanOutcome:
     failure: str | None
 
 
-def goal_brief(conn: sqlite3.Connection, config: Config, goal: Goal) -> str:
+def goal_brief(
+    conn: sqlite3.Connection,
+    config: Config,
+    goal: Goal,
+    *,
+    worker_limit: int | None = None,
+) -> str:
     """Text the foreman sees. Summaries only, not file contents."""
+    limit = config.max_parallel_workers if worker_limit is None else worker_limit
     lines = [
         f"Goal #{goal.id}: {goal.title}",
         goal.description or "(no description)",
         "",
+        "Brief:",
+        goal.brief or "(none yet)",
+        "",
+        f"Workers this turn: {limit}",
+        "",
         "Tasks:",
     ]
     tasks = list_tasks(conn, goal_id=goal.id)
+    ready_ids = {task.id for task in ready_tasks(conn, goal_id=goal.id)}
     if not tasks:
         lines.append("(none)")
     for task in tasks:
         deps = dependencies(conn, task.id)
         dep_text = ", ".join(f"#{dep.id} {dep.title}" for dep in deps) or "-"
+        availability = _availability(task, deps, ready_ids)
         lines.append(
-            f"- #{task.id} [{task.status.value}] p{task.priority} "
+            f"- #{task.id} [{task.status.value}] {availability}p{task.priority} "
             f"attempts {task.attempts}/{task.max_attempts} deps {dep_text}: {task.title}"
         )
         if task.feedback:
@@ -78,6 +97,7 @@ def run_foreman(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
+    worker_limit: int | None = None,
 ) -> ForemanOutcome:
     run = start_run(conn, role="foreman", model=config.models.foreman)
     if reporter:
@@ -88,7 +108,7 @@ def run_foreman(
             "repo_root": str(config.repo_root),
             "base_branch": config.base_branch,
             "integration_branch": goal.branch or goal_branch_name(goal.id, goal.title),
-            "state": goal_brief(conn, config, goal),
+            "state": goal_brief(conn, config, goal, worker_limit=worker_limit),
         },
     )
     log_path = config.runs_dir / f"{run.id}.log"
@@ -136,15 +156,38 @@ def apply_actions(
     config: Config,
     goal: Goal,
     actions: list[dict],
+    *,
+    agent_bin: str | None = None,
+    reporter: Callable[[str], None] | None = None,
+    worker_limit: int | None = None,
+    allow_dispatch: bool = True,
 ) -> list[str]:
-    """Apply foreman decisions. One bad action does not discard the rest."""
+    """Apply foreman decisions. One bad action does not discard the rest.
+
+    Scout, dispatch, and review run only when an action asks for them.
+    """
     refs: dict[str, int] = {}
     for task in list_tasks(conn, goal_id=goal.id):
         refs.setdefault(task.title, task.id)
+    limit = config.max_parallel_workers if worker_limit is None else worker_limit
+    dispatched = 0
     messages: list[str] = []
     for index, action in enumerate(actions, start=1):
         try:
-            message = _apply_one(conn, config, goal, action, refs)
+            if isinstance(action, dict) and action.get("type") == "dispatch":
+                if not allow_dispatch:
+                    message = "dispatch skipped"
+                elif dispatched >= limit:
+                    message = "limit reached, dispatch next turn"
+                else:
+                    message = _apply_one(
+                        conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter
+                    )
+                    dispatched += 1
+            else:
+                message = _apply_one(
+                    conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter
+                )
         except KilnError as exc:
             message = f"action {index} failed: {exc}"
         messages.append(message)
@@ -158,16 +201,24 @@ def _apply_one(
     goal: Goal,
     action: dict,
     refs: dict[str, int],
+    *,
+    agent_bin: str | None = None,
+    reporter: Callable[[str], None] | None = None,
 ) -> str:
     if not isinstance(action, dict):
         raise KilnError("action is not an object")
     kind = action.get("type")
     if kind == "create_task":
         return _create_task(conn, config, goal, action, refs)
-    if kind == "request_scout":
-        question = _text(action, "question")
-        enqueue_scout(conn, goal.id, question)
-        return f"queued scout: {question}"
+    if kind == "scout":
+        return _scout(conn, config, goal, action, agent_bin=agent_bin, reporter=reporter)
+    if kind == "dispatch":
+        return _dispatch(conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter)
+    if kind == "review":
+        return _review(conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter)
+    if kind == "update_brief":
+        updated = set_goal_brief(conn, goal.id, _text(action, "text"))
+        return f"updated brief for goal #{updated.id}"
     if kind == "approve":
         return approve_task(conn, config, _in_goal(conn, goal, _task_id(action)))
     if kind == "rework":
@@ -184,7 +235,7 @@ def _apply_one(
         note = add_note(conn, goal.id, _text(action, "text"))
         return f"note #{note.id}"
     if kind == "goal_done":
-        return _finish_goal(conn, goal)
+        return _finish_goal(conn, goal, action)
     raise KilnError(f"unknown action type {kind!r}")
 
 
@@ -228,13 +279,107 @@ def _create_task(
     return f"created task #{task.id} {task.title}"
 
 
-def _finish_goal(conn: sqlite3.Connection, goal: Goal) -> str:
+def _scout(
+    conn: sqlite3.Connection,
+    config: Config,
+    goal: Goal,
+    action: dict,
+    *,
+    agent_bin: str | None,
+    reporter: Callable[[str], None] | None,
+) -> str:
+    outcome = run_scout(
+        conn,
+        config,
+        _text(action, "question"),
+        goal_id=goal.id,
+        agent_bin=agent_bin,
+        reporter=reporter,
+    )
+    if outcome.note is None:
+        return f"scout failed: {outcome.failure}"
+    return f"scout note #{outcome.note.id} on goal #{goal.id}"
+
+
+def _dispatch(
+    conn: sqlite3.Connection,
+    config: Config,
+    goal: Goal,
+    action: dict,
+    refs: dict[str, int],
+    *,
+    agent_bin: str | None,
+    reporter: Callable[[str], None] | None,
+) -> str:
+    task_id = _resolve_task_ref(conn, goal, action, refs)
+    task = require_task(conn, task_id)
+    if task.status != TaskStatus.pending:
+        raise KilnError(f"task #{task_id} is {task.status.value}; only a pending task can be dispatched")
+    if task.id not in {ready.id for ready in ready_tasks(conn, goal_id=goal.id)}:
+        raise KilnError(f"task #{task_id} is blocked")
+    outcome = run_worker(conn, config, task_id=task_id, agent_bin=agent_bin, reporter=reporter)
+    branch = outcome.task.branch or ""
+    line = f"task #{outcome.task.id}  {outcome.task.status.value}  {branch}"
+    if outcome.failure:
+        return f"{line}: {outcome.failure}"
+    return line
+
+
+def _review(
+    conn: sqlite3.Connection,
+    config: Config,
+    goal: Goal,
+    action: dict,
+    refs: dict[str, int],
+    *,
+    agent_bin: str | None,
+    reporter: Callable[[str], None] | None,
+) -> str:
+    task_id = _resolve_task_ref(conn, goal, action, refs)
+    outcome = run_reviewer(
+        conn,
+        config,
+        task_id,
+        focus=_optional_text(action, "focus"),
+        agent_bin=agent_bin,
+        reporter=reporter,
+    )
+    if outcome.failure:
+        return f"review failed: {outcome.failure}"
+    return f"reviewed #{task_id}: {outcome.verdict}"
+
+
+def _finish_goal(conn: sqlite3.Connection, goal: Goal, action: dict) -> str:
     open_tasks = [task for task in list_tasks(conn, goal_id=goal.id) if task.status in _OPEN]
     if open_tasks:
         ids = ", ".join(f"#{task.id}" for task in open_tasks)
         raise KilnError(f"goal #{goal.id} still has open tasks: {ids}")
+    evidence = action.get("evidence")
+    if not isinstance(evidence, list):
+        raise KilnError("goal_done requires evidence")
+    set_goal_evidence(conn, goal.id, evidence)
     set_goal_status(conn, goal.id, GoalStatus.done)
     return f"goal #{goal.id} done"
+
+
+def _resolve_task_ref(conn: sqlite3.Connection, goal: Goal, action: dict, refs: dict[str, int]) -> int:
+    if "task_id" in action and action.get("task_id") is not None:
+        return _in_goal(conn, goal, _task_id(action))
+    ref = action.get("ref")
+    if isinstance(ref, str) and ref.strip() in refs:
+        return _in_goal(conn, goal, refs[ref.strip()])
+    raise KilnError("action needs a task_id or ref")
+
+
+def _availability(task: Task, deps: list[Task], ready_ids: set[int]) -> str:
+    if task.status != TaskStatus.pending:
+        return ""
+    if task.id in ready_ids:
+        return "ready "
+    waiting = [dep.id for dep in deps if dep.status != TaskStatus.done]
+    if not waiting:
+        return "blocked "
+    return "blocked by " + ", ".join(f"#{dep_id}" for dep_id in waiting) + " "
 
 
 def _resolve_dep(conn: sqlite3.Connection, goal_id: int, dep: object, refs: dict[str, int]) -> int:

@@ -85,12 +85,11 @@ kiln gc
 
 1. Remove leftover worktrees from finished tasks.
 2. Create the goal branch from `base_branch` if it does not exist yet.
-3. Scout a fresh goal once, and run any scout the previous tick queued.
-4. Ask the foreman for a fenced JSON action list, then apply it: create tasks, queue a scout, approve, rework, fail, cancel, take a note, or mark the goal done.
-5. Merge approved task branches into the goal branch. A conflict becomes rework.
-6. Dispatch ready tasks, up to `max_parallel_workers`.
+3. Ask the foreman for a fenced JSON action list, then apply it. The foreman chooses whether to scout, create tasks, dispatch a worker, request a review, approve, rework, fail, cancel, take a note, update its brief, or mark the goal done.
+4. Merge approved task branches into the goal branch. A conflict becomes rework.
+5. Run the scouts, workers, and reviewers the foreman asked for. At most `max_parallel_workers` workers start.
 
-When a goal has no pending, claimed, running, or review tasks and no scout waiting, Kiln pushes its branch and opens the pull request. If a tick changes nothing while work is still open, the run stops so it does not call the models forever.
+When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. If a tick changes nothing while work is still open, the run stops so it does not call the models forever.
 
 Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The foreman and scouts use `--mode ask` and do not edit the tree.
 

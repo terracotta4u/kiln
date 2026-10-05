@@ -15,7 +15,6 @@ from kiln.git import (
     remote_url,
 )
 from kiln.models import Goal, GoalStatus, TaskStatus
-from kiln.queue import pending_scouts
 from kiln.tasks import list_tasks, require_goal, set_goal_branch, set_goal_pr, set_goal_status
 
 _OPEN = (TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review)
@@ -55,8 +54,6 @@ def _goals_ready_to_publish(conn: sqlite3.Connection) -> list[Goal]:
             continue
         tasks = list_tasks(conn, goal_id=goal.id)
         if any(task.status in _OPEN for task in tasks):
-            continue
-        if pending_scouts(conn, goal.id):
             continue
         if not tasks and goal.status != GoalStatus.done:
             continue
