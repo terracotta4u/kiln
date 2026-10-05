@@ -123,8 +123,9 @@ def _config():
         verify="",
         max_parallel_workers=2,
         max_attempts=3,
+        max_foreman_turns=25,
         delete_merged_branches=True,
-        models=Models(foreman="foreman", worker="worker", scout="scout"),
+        models=Models(foreman="foreman", worker="worker", scout="scout", reviewer="reviewer"),
     )
 
 

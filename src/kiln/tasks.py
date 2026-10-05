@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from kiln.db import record_event, utc_now
@@ -51,6 +52,28 @@ def set_goal_branch(conn: sqlite3.Connection, goal_id: int, branch: str) -> Goal
     require_goal(conn, goal_id)
     conn.execute("UPDATE goals SET branch = ? WHERE id = ?", (branch, goal_id))
     record_event(conn, "goal.branch", f"goal #{goal_id} branch {branch}")
+    return require_goal(conn, goal_id)
+
+
+def set_goal_brief(conn: sqlite3.Connection, goal_id: int, text: str) -> Goal:
+    """Replace the foreman's running brief for a goal."""
+    require_goal(conn, goal_id)
+    cleaned = text.strip()
+    if not cleaned:
+        raise KilnError("goal brief cannot be empty")
+    conn.execute("UPDATE goals SET brief = ? WHERE id = ?", (cleaned, goal_id))
+    record_event(conn, "goal.brief", f"updated brief for goal #{goal_id}")
+    return require_goal(conn, goal_id)
+
+
+def set_goal_evidence(conn: sqlite3.Connection, goal_id: int, evidence: list[str]) -> Goal:
+    """Store why a goal is finished. Each item is one piece of evidence."""
+    require_goal(conn, goal_id)
+    if not evidence or any(not isinstance(item, str) or not item.strip() for item in evidence):
+        raise KilnError("goal evidence must be a non-empty list of strings")
+    stored = json.dumps([item.strip() for item in evidence])
+    conn.execute("UPDATE goals SET evidence = ? WHERE id = ?", (stored, goal_id))
+    record_event(conn, "goal.evidence", f"recorded evidence for goal #{goal_id}")
     return require_goal(conn, goal_id)
 
 

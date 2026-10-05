@@ -28,7 +28,9 @@ def test_init_writes_config_database_and_gitignore(repo):
     config = load_config(repo)
     assert config.base_branch == "main"
     assert config.models.foreman == "claude-opus-5-thinking-high"
+    assert config.models.reviewer == "claude-sonnet-5-thinking-high"
     assert config.max_attempts == 3
+    assert config.max_foreman_turns == 25
 
     original = (repo / "kiln.toml").read_text()
     again = runner.invoke(app, ["init"])
@@ -161,6 +163,33 @@ def test_log_and_runs_show(repo):
     missing = runner.invoke(app, ["runs", "show", "9"])
     assert missing.exit_code != 0
     assert "no run with id 9" in missing.output
+
+
+def test_missing_optional_settings_use_defaults(repo):
+    (repo / "kiln.toml").write_text(
+        """
+base_branch = "main"
+verify = ""
+max_parallel_workers = 2
+max_attempts = 3
+delete_merged_branches = true
+
+[models]
+foreman = "foreman"
+worker = "worker"
+scout = "scout"
+"""
+    )
+    config = load_config(repo)
+    assert config.max_foreman_turns == 25
+    assert config.models.reviewer == "claude-sonnet-5-thinking-high"
+
+    (repo / "kiln.toml").write_text((repo / "kiln.toml").read_text().replace(
+        'max_parallel_workers = 2',
+        'max_parallel_workers = 2\nmax_foreman_turns = 0',
+    ))
+    with pytest.raises(KilnError, match="max_foreman_turns"):
+        load_config(repo)
 
 
 def test_invalid_config_is_rejected(repo):
