@@ -1,12 +1,26 @@
-"""Run the Cursor `agent` CLI and pull a JSON report out of its reply.
+"""Run a coding-agent CLI and pull a JSON report out of its reply.
 
-Probed with `agent -p` on 2026-10-04:
+Cursor, probed with `agent -p` on 2026-10-04:
 
 - `--output-format json` prints one object:
   `{"type":"result","subtype":"success","is_error":false,"result":"<assistant text>",...}`
 - `--mode ask` is read-only and works together with `-p`.
 - `--trust` skips the workspace-trust prompt. Pass it on every non-interactive run
   so a fresh worktree cannot hang waiting for a person.
+
+Codex, probed with `codex exec --json` on 2026-10-05 (codex-cli 0.159.2, `--sandbox
+read-only`, model `gpt-6-luna`, a one-word prompt in a temp directory):
+
+- `--json` prints JSONL, one event per line. A successful turn was:
+  `{"type":"thread.started","thread_id":"..."}`
+  `{"type":"turn.started"}`
+  `{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"pong"}}`
+  `{"type":"turn.completed","usage":{"input_tokens":13501,"cached_input_tokens":11008,"output_tokens":5,"reasoning_output_tokens":0}}`
+- A failed turn (unknown model, exit 1) emitted an error item, then:
+  `{"type":"error","message":"..."}`
+  `{"type":"turn.failed","error":{"message":"..."}}`
+- The assistant text is the last `agent_message` item's `text`. Events with
+  `type` `error` or `turn.failed`, and items with `type` `error`, set `is_error`.
 """
 
 import json
@@ -17,11 +31,24 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from kiln.errors import KilnError
 
 DEFAULT_TIMEOUT_SECONDS = 600
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_CODEX_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "item.completed",
+        "item.started",
+        "item.updated",
+        "thread.started",
+        "turn.completed",
+        "turn.failed",
+        "turn.started",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -48,8 +75,115 @@ class AgentResult:
         return self.parsed.report
 
 
+class Harness(Protocol):
+    name: str
+
+    def default_bin(self) -> str: ...
+
+    def build_command(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        workspace: Path,
+        readonly: bool,
+        bin: str | None,
+    ) -> list[str]: ...
+
+    def parse_output(self, stdout: str) -> ParsedOutput: ...
+
+
+class CursorHarness:
+    name = "cursor"
+
+    def default_bin(self) -> str:
+        return os.environ.get("KILN_AGENT_BIN", "agent")
+
+    def build_command(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        workspace: Path,
+        readonly: bool,
+        bin: str | None,
+    ) -> list[str]:
+        return _cursor_argv(
+            prompt=prompt,
+            model=model,
+            workspace=workspace,
+            mode="ask" if readonly else None,
+            force=not readonly,
+            trust=True,
+            executable=bin or self.default_bin(),
+        )
+
+    def parse_output(self, stdout: str) -> ParsedOutput:
+        """Unwrap the JSON envelope, then take the last fenced JSON object."""
+        raw = stdout.strip()
+        envelope: dict | None = None
+        text = raw
+        parsed = _json_object(raw)
+        if parsed is not None and parsed.get("type") == "result" and isinstance(parsed.get("result"), str):
+            envelope = parsed
+            text = parsed["result"]
+        return ParsedOutput(text=text, report=_extract_report(text), envelope=envelope)
+
+
+class CodexHarness:
+    name = "codex"
+
+    def default_bin(self) -> str:
+        return os.environ.get("KILN_CODEX_BIN", "codex")
+
+    def build_command(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        workspace: Path,
+        readonly: bool,
+        bin: str | None,
+    ) -> list[str]:
+        sandbox = "read-only" if readonly else "workspace-write"
+        return [
+            bin or self.default_bin(),
+            "exec",
+            "-m",
+            model,
+            "-C",
+            str(workspace),
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--sandbox",
+            sandbox,
+            "--json",
+            prompt,
+        ]
+
+    def parse_output(self, stdout: str) -> ParsedOutput:
+        text, is_error, saw_events = _codex_jsonl(stdout)
+        if not saw_events:
+            raw = stdout.strip()
+            return ParsedOutput(text=raw, report=_extract_report(raw), envelope=None)
+        return ParsedOutput(
+            text=text,
+            report=_extract_report(text),
+            envelope={"is_error": is_error, "result": text},
+        )
+
+
+def get_harness(name: str) -> Harness:
+    if name == "cursor":
+        return CursorHarness()
+    if name == "codex":
+        return CodexHarness()
+    raise KilnError(f"unknown harness: {name}")
+
+
 def default_agent_bin() -> str:
-    return os.environ.get("KILN_AGENT_BIN", "agent")
+    return CursorHarness().default_bin()
 
 
 def build_command(
@@ -62,36 +196,20 @@ def build_command(
     trust: bool = True,
     agent_bin: str | None = None,
 ) -> list[str]:
-    command = [
-        agent_bin or default_agent_bin(),
-        "-p",
-        "--output-format",
-        "json",
-        "--workspace",
-        str(workspace),
-        "--model",
-        model,
-    ]
-    if trust:
-        command.append("--trust")
-    if mode:
-        command.extend(["--mode", mode])
-    if force:
-        command.append("--force")
-    command.append(prompt)
-    return command
+    return _cursor_argv(
+        prompt=prompt,
+        model=model,
+        workspace=workspace,
+        mode=mode,
+        force=force,
+        trust=trust,
+        executable=agent_bin or default_agent_bin(),
+    )
 
 
 def parse_agent_output(stdout: str) -> ParsedOutput:
     """Unwrap the JSON envelope, then take the last fenced JSON object."""
-    raw = stdout.strip()
-    envelope: dict | None = None
-    text = raw
-    parsed = _json_object(raw)
-    if parsed is not None and parsed.get("type") == "result" and isinstance(parsed.get("result"), str):
-        envelope = parsed
-        text = parsed["result"]
-    return ParsedOutput(text=text, report=_extract_report(text), envelope=envelope)
+    return CursorHarness().parse_output(stdout)
 
 
 def run_agent(
@@ -104,15 +222,33 @@ def run_agent(
     force: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     agent_bin: str | None = None,
+    harness: Harness | None = None,
+    readonly: bool | None = None,
 ) -> AgentResult:
-    command = build_command(
-        prompt=prompt,
-        model=model,
-        workspace=workspace,
-        mode=mode,
-        force=force,
-        agent_bin=agent_bin,
-    )
+    """Run ``harness`` (Cursor by default).
+
+    When ``readonly`` is omitted, ``mode="ask"`` is read-only and ``force=True``
+    is writable. Cursor calls that pass only those legacy flags keep today's
+    command line, including a run that sets neither.
+    """
+    selected: Harness = harness if harness is not None else CursorHarness()
+    if isinstance(selected, CursorHarness) and readonly is None:
+        command = build_command(
+            prompt=prompt,
+            model=model,
+            workspace=workspace,
+            mode=mode,
+            force=force,
+            agent_bin=agent_bin,
+        )
+    else:
+        command = selected.build_command(
+            prompt=prompt,
+            model=model,
+            workspace=workspace,
+            readonly=_resolve_readonly(mode=mode, force=force, readonly=readonly),
+            bin=agent_bin,
+        )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         process = subprocess.Popen(
@@ -140,10 +276,78 @@ def run_agent(
     return AgentResult(
         exit_code=code,
         stdout=captured,
-        parsed=parse_agent_output(captured),
+        parsed=selected.parse_output(captured),
         timed_out=timed_out,
         log_path=log_path,
     )
+
+
+def _resolve_readonly(*, mode: str | None, force: bool, readonly: bool | None) -> bool:
+    """Explicit ``readonly`` wins. Otherwise ``force=True`` writes and ``mode="ask"`` does not.
+
+    Codex only has read-only and workspace-write, so a call that sets neither
+    flag is read-only too. ``mode`` is accepted so the legacy ask flag stays
+    part of the call, and every non-force value takes that read-only path.
+    """
+    if readonly is not None:
+        return readonly
+    if force:
+        return False
+    if mode == "ask":
+        return True
+    return True
+
+
+def _cursor_argv(
+    *,
+    prompt: str,
+    model: str,
+    workspace: Path,
+    mode: str | None,
+    force: bool,
+    trust: bool,
+    executable: str,
+) -> list[str]:
+    command = [
+        executable,
+        "-p",
+        "--output-format",
+        "json",
+        "--workspace",
+        str(workspace),
+        "--model",
+        model,
+    ]
+    if trust:
+        command.append("--trust")
+    if mode:
+        command.extend(["--mode", mode])
+    if force:
+        command.append("--force")
+    command.append(prompt)
+    return command
+
+
+def _codex_jsonl(stdout: str) -> tuple[str, bool, bool]:
+    """Return ``(assistant text, is_error, saw_events)`` from Codex JSONL."""
+    text = ""
+    is_error = False
+    saw_events = False
+    for line in stdout.splitlines():
+        event = _json_object(line)
+        if event is None or event.get("type") not in _CODEX_EVENT_TYPES:
+            continue
+        saw_events = True
+        if event.get("type") in {"error", "turn.failed"}:
+            is_error = True
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            text = item["text"]
+        elif item.get("type") == "error":
+            is_error = True
+    return text, is_error, saw_events
 
 
 def _capture(
