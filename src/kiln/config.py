@@ -9,8 +9,10 @@ from kiln.errors import KilnError
 DEFAULT_FOREMAN_MODEL = "claude-opus-5-thinking-high"
 DEFAULT_WORKER_MODEL = "claude-sonnet-5-thinking-high"
 DEFAULT_SCOUT_MODEL = "composer-2.5"
+DEFAULT_REVIEWER_MODEL = "claude-sonnet-5-thinking-high"
 DEFAULT_MAX_PARALLEL_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_FOREMAN_TURNS = 25
 
 KILN_DIRNAME = ".kiln"
 CONFIG_FILENAME = "kiln.toml"
@@ -22,6 +24,7 @@ class Models:
     foreman: str
     worker: str
     scout: str
+    reviewer: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class Config:
     verify: str
     max_parallel_workers: int
     max_attempts: int
+    max_foreman_turns: int
     delete_merged_branches: bool
     models: Models
 
@@ -115,11 +119,13 @@ def _config_from_data(root: Path, toml_path: Path, data: dict) -> Config:
         verify=_require_str(data, "verify", allow_empty=True),
         max_parallel_workers=_require_positive_int(data, "max_parallel_workers"),
         max_attempts=_require_positive_int(data, "max_attempts"),
+        max_foreman_turns=_optional_positive_int(data, "max_foreman_turns", DEFAULT_MAX_FOREMAN_TURNS),
         delete_merged_branches=_require_bool(data, "delete_merged_branches"),
         models=Models(
             foreman=_require_str(models_data, "foreman", label="models.foreman"),
             worker=_require_str(models_data, "worker", label="models.worker"),
             scout=_require_str(models_data, "scout", label="models.scout"),
+            reviewer=_optional_str(models_data, "reviewer", DEFAULT_REVIEWER_MODEL, label="models.reviewer"),
         ),
     )
 
@@ -137,6 +143,18 @@ def _require_bool(data: dict, key: str) -> bool:
     if not isinstance(value, bool):
         raise KilnError(f"kiln.toml is missing {key}")
     return value
+
+
+def _optional_str(data: dict, key: str, default: str, *, label: str | None = None) -> str:
+    if key not in data:
+        return default
+    return _require_str(data, key, label=label)
+
+
+def _optional_positive_int(data: dict, key: str, default: int) -> int:
+    if key not in data:
+        return default
+    return _require_positive_int(data, key)
 
 
 def _require_positive_int(data: dict, key: str) -> int:
@@ -160,11 +178,14 @@ base_branch = {_toml_string(base_branch)}
 # Command run in the worktree after a worker finishes. Empty skips verification.
 verify = ""
 
-# How many workers `kiln run` may dispatch in one tick.
+# How many scouts, workers, and reviewers one turn may run at once.
 max_parallel_workers = {DEFAULT_MAX_PARALLEL_WORKERS}
 
 # Rework attempts before a task is failed.
 max_attempts = {DEFAULT_MAX_ATTEMPTS}
+
+# Foreman turns one `kiln run` may take before it stops.
+max_foreman_turns = {DEFAULT_MAX_FOREMAN_TURNS}
 
 # Delete a task branch after it merges into the goal branch.
 delete_merged_branches = true
@@ -173,6 +194,7 @@ delete_merged_branches = true
 foreman = {_toml_string(DEFAULT_FOREMAN_MODEL)}
 worker = {_toml_string(DEFAULT_WORKER_MODEL)}
 scout = {_toml_string(DEFAULT_SCOUT_MODEL)}
+reviewer = {_toml_string(DEFAULT_REVIEWER_MODEL)}
 """
 
 

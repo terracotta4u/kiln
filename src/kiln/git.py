@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,12 @@ def diffstat(repo: Path, base: str, branch: str) -> str:
     return result.stdout.strip()
 
 
+def branch_diff(repo: Path, base: str, branch: str) -> str:
+    """Full diff of commits on branch that are not in base."""
+    result = _git(repo, "diff", f"{base}...{branch}")
+    return result.stdout
+
+
 def commit_if_dirty(worktree: Path, message: str) -> bool:
     """Commit tracked and untracked changes. Returns whether a commit was made."""
     status = _git(worktree, "status", "--porcelain")
@@ -147,17 +154,26 @@ def _missing_identity(stderr: str) -> bool:
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    result = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        check=False,
-    )
-    if check and result.returncode != 0:
+    for attempt in range(5):
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+        )
+        if not check or result.returncode == 0:
+            return result
         detail = (result.stderr or result.stdout).strip()
+        if attempt < 4 and _git_lock(detail):
+            time.sleep(0.05 * (attempt + 1))
+            continue
         raise KilnError(detail or f"git {' '.join(args)} failed")
-    return result
+    raise KilnError(f"git {' '.join(args)} failed")
+
+
+def _git_lock(detail: str) -> bool:
+    return "index.lock" in detail or "Another git process" in detail or "could not lock" in detail

@@ -1,6 +1,9 @@
+import json
 import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
+
+from kiln.errors import KilnError
 
 
 class GoalStatus(StrEnum):
@@ -33,6 +36,8 @@ class Goal:
     created_at: str
     branch: str | None = None
     pr_url: str | None = None
+    brief: str | None = None
+    evidence: tuple[str, ...] | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Goal":
@@ -44,6 +49,8 @@ class Goal:
             created_at=row["created_at"],
             branch=row["branch"],
             pr_url=row["pr_url"],
+            brief=row["brief"],
+            evidence=_evidence(row["evidence"]),
         )
 
 
@@ -84,6 +91,18 @@ class Task:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+def _evidence(value: str | None) -> tuple[str, ...] | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise KilnError("goal evidence is not a list of strings") from exc
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise KilnError("goal evidence is not a list of strings")
+    return tuple(parsed)
 
 
 @dataclass(frozen=True)

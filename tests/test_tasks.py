@@ -13,6 +13,8 @@ from kiln.tasks import (
     claim_next,
     claim_task,
     ready_tasks,
+    set_goal_brief,
+    set_goal_evidence,
     set_task_status,
 )
 
@@ -27,7 +29,7 @@ def conn(tmp_path):
 
 def test_migrate_is_idempotent(conn):
     migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_migrate_upgrades_a_v1_database(tmp_path):
@@ -45,10 +47,44 @@ def test_migrate_upgrades_a_v1_database(tmp_path):
     )
     connection.execute("PRAGMA user_version = 1")
     migrate(connection)
-    connection.execute("SELECT branch, pr_url FROM goals")
+    connection.execute("SELECT branch, pr_url, brief, evidence FROM goals")
     connection.execute("SELECT 1 FROM scout_requests")
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     connection.close()
+
+
+def test_migrate_upgrades_a_v3_database(tmp_path):
+    connection = connect(tmp_path / "kiln.db")
+    connection.executescript(
+        """
+        CREATE TABLE goals (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            branch TEXT,
+            pr_url TEXT
+        );
+        """
+    )
+    connection.execute("PRAGMA user_version = 3")
+    migrate(connection)
+    connection.execute("SELECT brief, evidence FROM goals")
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    connection.close()
+
+
+def test_goal_brief_and_evidence_round_trip(conn):
+    goal = add_goal(conn, "Ship it")
+    updated = set_goal_brief(conn, goal.id, "  Success: the marker exists.  ")
+    finished = set_goal_evidence(conn, goal.id, ["pytest passed", " review found no blockers "])
+    assert updated.brief == "Success: the marker exists."
+    assert finished.evidence == ("pytest passed", "review found no blockers")
+    with pytest.raises(KilnError, match="brief"):
+        set_goal_brief(conn, goal.id, "   ")
+    with pytest.raises(KilnError, match="evidence"):
+        set_goal_evidence(conn, goal.id, [])
 
 
 def test_ready_set_respects_dependencies_and_status(conn):
