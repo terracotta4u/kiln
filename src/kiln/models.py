@@ -31,6 +31,8 @@ class Goal:
     description: str
     status: GoalStatus
     created_at: str
+    branch: str | None = None
+    pr_url: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Goal":
@@ -40,6 +42,8 @@ class Goal:
             description=row["description"],
             status=GoalStatus(row["status"]),
             created_at=row["created_at"],
+            branch=row["branch"],
+            pr_url=row["pr_url"],
         )
 
 

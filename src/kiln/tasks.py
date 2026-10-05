@@ -47,6 +47,20 @@ def set_goal_status(conn: sqlite3.Connection, goal_id: int, status: GoalStatus) 
     return require_goal(conn, goal_id)
 
 
+def set_goal_branch(conn: sqlite3.Connection, goal_id: int, branch: str) -> Goal:
+    require_goal(conn, goal_id)
+    conn.execute("UPDATE goals SET branch = ? WHERE id = ?", (branch, goal_id))
+    record_event(conn, "goal.branch", f"goal #{goal_id} branch {branch}")
+    return require_goal(conn, goal_id)
+
+
+def set_goal_pr(conn: sqlite3.Connection, goal_id: int, url: str) -> Goal:
+    require_goal(conn, goal_id)
+    conn.execute("UPDATE goals SET pr_url = ? WHERE id = ?", (url, goal_id))
+    record_event(conn, "goal.pr", url or f"goal #{goal_id} has no pull request")
+    return require_goal(conn, goal_id)
+
+
 def require_goal(conn: sqlite3.Connection, goal_id: int) -> Goal:
     goal = get_goal(conn, goal_id)
     if goal is None:

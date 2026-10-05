@@ -2,7 +2,7 @@
 
 Kiln is a software factory for one git repository. You give it a goal. A foreman plans and reviews. Disposable workers do the tasks, each in its own git worktree and branch. Scouts explore the repo and report back. Only workers write code. The foreman and scouts run read-only, and Kiln applies their decisions itself.
 
-Kiln drives the Cursor CLI (`agent`). One tick of `kiln run` does a cycle of work and then exits.
+Kiln drives the Cursor CLI (`agent`). `kiln run` keeps working until the goal is finished, then opens one pull request.
 
 ## Setup
 
@@ -29,14 +29,16 @@ kiln goal add "Add a health check" --description "GET /health returns 200"
 kiln run
 ```
 
-The first tick scouts a fresh goal, asks the foreman to break it into tasks, and dispatches workers for anything that is ready. Run `kiln run` again to review finished work and merge it. Keep going until the goal is done.
+`kiln run` creates a branch for the goal (`kiln/goal-<id>-<slug>`), scouts, asks the foreman to break the goal into tasks, and dispatches workers. Each approved task is merged onto that goal branch as soon as it passes review. When nothing is left to do, Kiln pushes the branch to `origin` and opens one pull request into `base_branch`.
 
-A task is ready when it is pending and every dependency is done. Done means the branch has been merged into `base_branch`.
+A task is ready when it is pending and every dependency is done. Done means the task branch has been merged into the goal branch.
+
+The repository needs an `origin` remote and the GitHub CLI (`gh`) so the pull request can be opened.
 
 ```bash
-kiln run --dry-run      # print the tick; change nothing
-kiln run --no-dispatch  # scout, plan, and merge; skip workers
-kiln run --workers 1    # cap how many workers this tick starts
+kiln run --dry-run      # print one tick; change nothing
+kiln run --no-dispatch  # one tick: scout, plan, and merge; skip workers
+kiln run --workers 1    # cap how many workers a tick starts
 ```
 
 ## Looking around
@@ -67,7 +69,7 @@ kiln review 1 --rework "The handler ignores the timeout"
 kiln review 1 --fail --reason "Wrong approach"
 ```
 
-`kiln review` accepts exactly one of `--approve`, `--rework`, or `--fail`. Approve merges the task branch. A conflict sends the task back to pending with the conflict in its feedback. Rework does the same with your note, and the next worker keeps the branch.
+`kiln review` accepts exactly one of `--approve`, `--rework`, or `--fail`. Approve merges the task branch into the goal branch. A conflict sends the task back to pending with the conflict in its feedback. Rework does the same with your note, and the next worker keeps the branch.
 
 ## Cleanup
 
@@ -77,15 +79,20 @@ Finished tasks (done, failed, cancelled) do not need a checkout. `kiln gc` remov
 kiln gc
 ```
 
-## What a tick does
+## What a run does
+
+`kiln run` repeats a tick until every active goal is finished:
 
 1. Remove leftover worktrees from finished tasks.
-2. Scout a fresh goal once, and run any scout the previous tick queued.
-3. Ask the foreman for a fenced JSON action list, then apply it: create tasks, queue a scout, approve, rework, fail, cancel, take a note, or mark the goal done.
-4. Merge approved branches. A conflict becomes rework.
-5. Dispatch ready tasks, up to `max_parallel_workers`.
+2. Create the goal branch from `base_branch` if it does not exist yet.
+3. Scout a fresh goal once, and run any scout the previous tick queued.
+4. Ask the foreman for a fenced JSON action list, then apply it: create tasks, queue a scout, approve, rework, fail, cancel, take a note, or mark the goal done.
+5. Merge approved task branches into the goal branch. A conflict becomes rework.
+6. Dispatch ready tasks, up to `max_parallel_workers`.
 
-Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/`, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The foreman and scouts use `--mode ask` and do not edit the tree.
+When a goal has no pending, claimed, running, or review tasks and no scout waiting, Kiln pushes its branch and opens the pull request. If a tick changes nothing while work is still open, the run stops so it does not call the models forever.
+
+Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The foreman and scouts use `--mode ask` and do not edit the tree.
 
 A task that has used `max_attempts` fails instead of starting another attempt.
 
@@ -95,11 +102,11 @@ A task that has used `max_attempts` fails instead of starting another attempt.
 
 | Key | Meaning |
 | --- | --- |
-| `base_branch` | Branch workers merge into. `kiln init` uses the current branch. |
+| `base_branch` | Branch the pull request targets. `kiln init` uses the current branch. |
 | `verify` | Shell command run in the worktree after a worker finishes. Empty skips it. |
 | `max_parallel_workers` | How many workers one tick may start. Default 2. |
 | `max_attempts` | Rework attempts before a task fails. Default 3. |
-| `delete_merged_branches` | Delete a task branch after a clean merge. Default true. |
+| `delete_merged_branches` | Delete a task branch after it merges into the goal branch. Default true. The goal branch stays. |
 | `models.foreman` | Frontier model for planning and review. |
 | `models.worker` | Model that edits code. |
 | `models.scout` | Cheaper model for exploration. |

@@ -16,8 +16,16 @@ class MergeResult:
 
 
 def branch_name(task_id: int, title: str) -> str:
+    return f"kiln/{task_id}-{_slug(title, 'task')}"
+
+
+def goal_branch_name(goal_id: int, title: str) -> str:
+    return f"kiln/goal-{goal_id}-{_slug(title, 'goal')}"
+
+
+def _slug(title: str, fallback: str) -> str:
     slug = _SLUG.sub("-", title.lower()).strip("-")[:40].strip("-")
-    return f"kiln/{task_id}-{slug or 'task'}"
+    return slug or fallback
 
 
 def ensure_worktree(repo: Path, worktree: Path, branch: str, base: str) -> None:
@@ -45,6 +53,29 @@ def prune_worktrees(repo: Path) -> str:
 
 def branch_exists(repo: Path, branch: str) -> bool:
     return _branch_exists(repo, branch)
+
+
+def ensure_branch(repo: Path, branch: str, base: str) -> None:
+    """Create branch at base without checking it out."""
+    if _branch_exists(repo, branch):
+        return
+    _git(repo, "branch", branch, base)
+
+
+def commits_ahead(repo: Path, base: str, branch: str) -> int:
+    result = _git(repo, "rev-list", "--count", f"{base}..{branch}")
+    return int(result.stdout.strip() or "0")
+
+
+def remote_url(repo: Path, remote: str = "origin") -> str | None:
+    result = _git(repo, "remote", "get-url", remote, check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def push_branch(repo: Path, branch: str, remote: str = "origin") -> None:
+    _git(repo, "push", "-u", remote, f"{branch}:{branch}")
 
 
 def delete_branch(repo: Path, branch: str) -> None:

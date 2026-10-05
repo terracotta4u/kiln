@@ -7,7 +7,7 @@ from kiln.agent import DEFAULT_TIMEOUT_SECONDS, run_agent
 from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
-from kiln.git import diffstat
+from kiln.git import diffstat, goal_branch_name
 from kiln.models import Goal, GoalStatus, Run, RunStatus, Task, TaskStatus
 from kiln.notes import add_note, list_notes
 from kiln.prompts import render_prompt
@@ -57,7 +57,7 @@ def goal_brief(conn: sqlite3.Connection, config: Config, goal: Goal) -> str:
         if task.feedback:
             lines.append(f"  feedback: {task.feedback}")
         if task.status == TaskStatus.review:
-            lines.extend(_review_lines(conn, config, task))
+            lines.extend(_review_lines(conn, config, goal, task))
     lines.append("")
     lines.append("Notes:")
     notes = list_notes(conn, goal.id)
@@ -87,6 +87,7 @@ def run_foreman(
         {
             "repo_root": str(config.repo_root),
             "base_branch": config.base_branch,
+            "integration_branch": goal.branch or goal_branch_name(goal.id, goal.title),
             "state": goal_brief(conn, config, goal),
         },
     )
@@ -269,11 +270,12 @@ def _task_in_goal(conn: sqlite3.Connection, goal_id: int, task_id: int) -> int:
     return task.id
 
 
-def _review_lines(conn: sqlite3.Connection, config: Config, task: Task) -> list[str]:
+def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Task) -> list[str]:
     lines: list[str] = []
     if task.branch:
         try:
-            changes = diffstat(config.repo_root, config.base_branch, task.branch)
+            base = goal.branch or config.base_branch
+            changes = diffstat(config.repo_root, base, task.branch)
         except KilnError as exc:
             changes = str(exc)
         lines.append("  diffstat:")

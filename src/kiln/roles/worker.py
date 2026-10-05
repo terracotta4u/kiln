@@ -12,6 +12,7 @@ from kiln.errors import KilnError
 from kiln.git import branch_name, commit_if_dirty, diffstat, ensure_worktree
 from kiln.models import Run, RunStatus, Task, TaskStatus
 from kiln.prompts import render_prompt
+from kiln.publish import ensure_goal_branch
 from kiln.runs import finish_run, start_run
 from kiln.tasks import (
     claim_task,
@@ -51,7 +52,8 @@ def run_worker(
     branch = task.branch or branch_name(task.id, task.title)
     worktree = Path(task.worktree_path) if task.worktree_path else config.worktrees_dir / str(task.id)
     try:
-        ensure_worktree(config.repo_root, worktree, branch, config.base_branch)
+        integration, _ = ensure_goal_branch(conn, config, require_goal(conn, task.goal_id))
+        ensure_worktree(config.repo_root, worktree, branch, integration)
     except KilnError:
         release_claim(conn, task.id)
         raise
@@ -66,6 +68,7 @@ def run_worker(
         {
             "repo_root": str(config.repo_root),
             "branch": branch,
+            "integration_branch": integration,
             "base_branch": config.base_branch,
             "goal_id": str(goal.id),
             "goal_title": goal.title,
@@ -104,7 +107,7 @@ def run_worker(
         verify_code, verify_out = _run_verify(config.verify, worktree)
 
     try:
-        changes = diffstat(config.repo_root, config.base_branch, branch)
+        changes = diffstat(config.repo_root, integration, branch)
     except KilnError as exc:
         failure = failure or str(exc)
 

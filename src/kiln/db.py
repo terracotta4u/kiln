@@ -5,7 +5,7 @@ from pathlib import Path
 from kiln.errors import KilnError
 from kiln.models import Event
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_V1 = """
 CREATE TABLE goals (
@@ -13,7 +13,9 @@ CREATE TABLE goals (
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'done')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    branch TEXT,
+    pr_url TEXT
 );
 
 CREATE TABLE tasks (
@@ -121,6 +123,18 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 2:
         conn.executescript(SCHEMA_V2)
         conn.execute("PRAGMA user_version = 2")
+        version = 2
+    if version < 3:
+        _add_column(conn, "goals", "branch", "TEXT")
+        _add_column(conn, "goals", "pr_url", "TEXT")
+        conn.execute("PRAGMA user_version = 3")
+
+
+def _add_column(conn: sqlite3.Connection, table: str, name: str, declaration: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(row["name"] == name for row in rows):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
 def list_events(conn: sqlite3.Connection, *, limit: int) -> list[Event]:

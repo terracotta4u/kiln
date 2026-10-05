@@ -16,7 +16,7 @@ from kiln.review import approve_task, reject_task, send_back
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
 from kiln.runs import require_run
-from kiln.tick import run_tick
+from kiln.tick import run_tick, run_until_done
 from kiln.tasks import (
     add_dependency,
     add_goal,
@@ -132,19 +132,22 @@ def run(
     no_dispatch: bool = typer.Option(False, "--no-dispatch", help="Do not start workers."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the tick and change nothing."),
 ) -> None:
-    """Run one factory tick: scout, foreman, merge, then workers."""
+    """Run until every active goal is finished, then open a pull request."""
 
     def render(config: Config, conn) -> None:
-        outcome = run_tick(
-            conn,
-            config,
-            workers=workers,
-            dispatch=not no_dispatch,
-            dry_run=dry_run,
-            reporter=typer.echo,
-        )
-        for line in outcome.lines:
-            typer.echo(line)
+        if dry_run or no_dispatch:
+            outcome = run_tick(
+                conn,
+                config,
+                workers=workers,
+                dispatch=not no_dispatch,
+                dry_run=dry_run,
+                reporter=typer.echo,
+            )
+            for line in outcome.lines:
+                typer.echo(line)
+            return
+        run_until_done(conn, config, workers=workers, reporter=typer.echo)
 
     _with_db(render)
 
@@ -456,6 +459,10 @@ def _echo_goal(goal: Goal) -> None:
     typer.echo(f"status       {goal.status.value}")
     typer.echo(f"title        {goal.title}")
     typer.echo(f"created      {goal.created_at}")
+    if goal.branch:
+        typer.echo(f"branch       {goal.branch}")
+    if goal.pr_url:
+        typer.echo(f"pull request {goal.pr_url}")
     typer.echo("\ndescription")
     typer.echo(goal.description or "(none)")
 

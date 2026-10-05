@@ -154,7 +154,7 @@ def _toml_string(value: str) -> str:
 def _toml_template(base_branch: str) -> str:
     return f"""# Kiln factory settings for this repository.
 
-# Branch workers merge into.
+# Branch the pull request targets.
 base_branch = {_toml_string(base_branch)}
 
 # Command run in the worktree after a worker finishes. Empty skips verification.
@@ -166,7 +166,7 @@ max_parallel_workers = {DEFAULT_MAX_PARALLEL_WORKERS}
 # Rework attempts before a task is failed.
 max_attempts = {DEFAULT_MAX_ATTEMPTS}
 
-# Delete a task branch after it merges.
+# Delete a task branch after it merges into the goal branch.
 delete_merged_branches = true
 
 [models]

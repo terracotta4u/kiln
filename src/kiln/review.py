@@ -5,21 +5,23 @@ from kiln.config import Config
 from kiln.errors import KilnError
 from kiln.git import delete_branch, merge_branch, remove_worktree
 from kiln.models import TaskStatus
-from kiln.tasks import fail_task, require_task, rework_task, set_task_status
+from kiln.publish import ensure_goal_branch
+from kiln.tasks import fail_task, require_goal, require_task, rework_task, set_task_status
 
 
 def approve_task(conn: sqlite3.Connection, config: Config, task_id: int) -> str:
-    """Merge a reviewed task into the base branch. A conflict sends it back for rework."""
+    """Merge a reviewed task into the goal branch. A conflict sends it back for rework."""
     task = _require_review(conn, task_id)
     if not task.branch:
         raise KilnError(f"task #{task_id} has no branch to merge")
+    integration, _ = ensure_goal_branch(conn, config, require_goal(conn, task.goal_id))
     _remove_worktree(config, task.worktree_path)
-    result = merge_branch(config.repo_root, task.branch, config.base_branch)
+    result = merge_branch(config.repo_root, task.branch, integration)
     if not result.merged:
         rework_task(
             conn,
             task_id,
-            f"Merge into {config.base_branch} conflicted.\n{result.message}",
+            f"Merge into {integration} conflicted.\n{result.message}",
         )
         return f"task #{task_id} conflicted and was sent back for rework"
     set_task_status(conn, task_id, TaskStatus.done)
@@ -27,8 +29,8 @@ def approve_task(conn: sqlite3.Connection, config: Config, task_id: int) -> str:
         try:
             delete_branch(config.repo_root, task.branch)
         except KilnError as exc:
-            return f"task #{task_id} merged into {config.base_branch}; branch not deleted: {exc}"
-    return f"task #{task_id} merged into {config.base_branch}"
+            return f"task #{task_id} merged into {integration}; branch not deleted: {exc}"
+    return f"task #{task_id} merged into {integration}"
 
 
 def send_back(conn: sqlite3.Connection, task_id: int, feedback: str) -> str:

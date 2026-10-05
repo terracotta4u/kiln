@@ -16,7 +16,7 @@ from kiln.queue import pending_scouts
 from kiln.roles.worker import run_worker
 from kiln.review import approve_task
 from kiln.tasks import add_goal, add_task, get_task, list_tasks
-from kiln.tick import run_tick
+from kiln.tick import run_tick, run_until_done
 
 runner = CliRunner()
 
@@ -55,8 +55,16 @@ def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
     assert on_main_after_work is False
     assert stored is not None
     assert stored.status == TaskStatus.done
-    assert (factory / "marker.txt").read_text() == "ok\n"
-    assert any("merged into main" in line for line in second.lines)
+    assert not (factory / "marker.txt").exists()
+    marker = subprocess.run(
+        ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
+        cwd=factory,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert marker.stdout == "ok\n"
+    assert any("merged into kiln/goal-1-ship-it" in line for line in second.lines)
     assert not (factory / ".kiln" / "worktrees" / "1").exists()
     missing = subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/kiln/1-add-marker"],
@@ -79,8 +87,13 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
         goal = add_goal(conn, "Ship it")
         task = add_task(conn, goal.id, "Edit readme")
         run_worker(conn, config, task_id=task.id, agent_bin=str(script))
-        (factory / "README.md").write_text("main\n")
-        subprocess.run(["git", "commit", "-am", "main edit"], cwd=factory, check=True, capture_output=True)
+        from kiln.tasks import require_goal
+
+        integration = require_goal(conn, goal.id).branch
+        subprocess.run(["git", "checkout", integration], cwd=factory, check=True, capture_output=True)
+        (factory / "README.md").write_text("goal\n")
+        subprocess.run(["git", "commit", "-am", "goal edit"], cwd=factory, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "main"], cwd=factory, check=True, capture_output=True)
         message = approve_task(conn, config, task.id)
         stored = get_task(conn, task.id)
     finally:
@@ -90,7 +103,15 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
     assert stored is not None
     assert stored.status == TaskStatus.pending
     assert stored.feedback is not None and "conflicted" in stored.feedback
-    assert (factory / "README.md").read_text() == "main\n"
+    assert (factory / "README.md").read_text() == "hello\n"
+    goal_readme = subprocess.run(
+        ["git", "show", f"{integration}:README.md"],
+        cwd=factory,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert goal_readme.stdout == "goal\n"
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{stored.branch}"],
         cwd=factory,
@@ -186,6 +207,57 @@ def test_two_workers_run_together(factory: Path):
     assert [task.status for task in tasks] == [TaskStatus.review, TaskStatus.review]
 
 
+def test_run_until_done_opens_one_pull_request(factory: Path):
+    bare = factory.parent / f"{factory.name}-origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=factory, check=True)
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=factory, check=True, capture_output=True)
+    script = _agent(factory, _smart_agent())
+    gh = factory / "fake-gh"
+    gh.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(factory / 'pr-args.txt')!r}).write_text('\\n'.join(sys.argv[1:]))\n"
+        "print('https://example.com/pull/1')\n"
+    )
+    gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it", "Add a marker file")
+        result = run_until_done(conn, config, agent_bin=str(script), gh_bin=str(gh))
+        goal = get_goal_row(conn)
+        from kiln.tasks import list_goals
+
+        stored = list_goals(conn)[0]
+    finally:
+        conn.close()
+
+    assert goal == GoalStatus.done
+    assert stored.pr_url == "https://example.com/pull/1"
+    assert any("opened https://example.com/pull/1" in line for line in result.lines)
+    assert not (factory / "marker.txt").exists()
+    marker = subprocess.run(
+        ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
+        cwd=factory,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert marker.stdout == "ok\n"
+    subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--heads", "origin", "kiln/goal-1-ship-it"],
+        cwd=factory,
+        check=True,
+        capture_output=True,
+    )
+    args = (factory / "pr-args.txt").read_text()
+    assert "pr\ncreate" in args
+    assert "--base\nmain" in args
+    assert "--head\nkiln/goal-1-ship-it" in args
+
+
 def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
     script = _agent(
         factory,
@@ -200,8 +272,16 @@ def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
     assert worked.exit_code == 0, worked.output
     approved = runner.invoke(app, ["review", "1", "--approve"])
     assert approved.exit_code == 0, approved.output
-    assert "merged into main" in approved.output
-    assert (factory / "marker.txt").read_text() == "ok\n"
+    assert "merged into kiln/goal-1-ship-it" in approved.output
+    assert not (factory / "marker.txt").exists()
+    marker = subprocess.run(
+        ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
+        cwd=factory,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert marker.stdout == "ok\n"
 
 
 def _smart_agent() -> str:

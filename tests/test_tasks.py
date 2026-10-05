@@ -27,7 +27,7 @@ def conn(tmp_path):
 
 def test_migrate_is_idempotent(conn):
     migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_migrate_upgrades_a_v1_database(tmp_path):
@@ -45,8 +45,9 @@ def test_migrate_upgrades_a_v1_database(tmp_path):
     )
     connection.execute("PRAGMA user_version = 1")
     migrate(connection)
+    connection.execute("SELECT branch, pr_url FROM goals")
     connection.execute("SELECT 1 FROM scout_requests")
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     connection.close()
 
 
