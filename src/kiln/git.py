@@ -87,6 +87,12 @@ def diffstat(repo: Path, base: str, branch: str) -> str:
     return result.stdout.strip()
 
 
+def branch_diff(repo: Path, base: str, branch: str) -> str:
+    """Full diff of commits on branch that are not in base."""
+    result = _git(repo, "diff", f"{base}...{branch}")
+    return result.stdout
+
+
 def commit_if_dirty(worktree: Path, message: str) -> bool:
     """Commit tracked and untracked changes. Returns whether a commit was made."""
     status = _git(worktree, "status", "--porcelain")

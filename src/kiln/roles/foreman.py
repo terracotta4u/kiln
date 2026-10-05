@@ -280,15 +280,23 @@ def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Ta
             changes = str(exc)
         lines.append("  diffstat:")
         lines.append(changes or "  (no changes)")
-    run = latest_run(conn, task.id, "worker")
-    if run is None or not run.report_json:
-        return lines
+    worker = latest_run(conn, task.id, "worker")
+    if worker is not None and worker.report_json:
+        lines.extend(_worker_report_lines(worker.report_json))
+    review = latest_run(conn, task.id, "reviewer")
+    if review is not None and review.report_json and (worker is None or review.id > worker.id):
+        lines.extend(_reviewer_report_lines(review.report_json))
+    return lines
+
+
+def _worker_report_lines(raw: str) -> list[str]:
     try:
-        report = json.loads(run.report_json)
+        report = json.loads(raw)
     except json.JSONDecodeError:
-        return lines
+        return []
     if not isinstance(report, dict):
-        return lines
+        return []
+    lines: list[str] = []
     worker = report.get("worker")
     if isinstance(worker, dict) and isinstance(worker.get("summary"), str):
         lines.append(f"  summary: {worker['summary']}")
@@ -302,6 +310,26 @@ def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Ta
         lines.append(f"  verify exit {code}")
         if tail:
             lines.append(tail)
+    return lines
+
+
+def _reviewer_report_lines(raw: str) -> list[str]:
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(report, dict):
+        return []
+    verdict = report.get("verdict")
+    summary = report.get("summary")
+    if not isinstance(verdict, str) or not isinstance(summary, str):
+        return []
+    lines = [f"  review: {verdict} — {summary}"]
+    findings = report.get("findings")
+    if isinstance(findings, list):
+        for item in findings:
+            if isinstance(item, str) and item.strip():
+                lines.append(f"  - {item.strip()}")
     return lines
 
 
