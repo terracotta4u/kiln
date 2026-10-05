@@ -81,15 +81,15 @@ kiln gc
 
 ## What a run does
 
-`kiln run` repeats a tick until every active goal is finished:
+`kiln run` repeats a turn until every active goal is finished. Each turn asks the foreman once:
 
 1. Remove leftover worktrees from finished tasks.
 2. Create the goal branch from `base_branch` if it does not exist yet.
-3. Ask the foreman for a fenced JSON action list, then apply it. The foreman chooses whether to scout, create tasks, dispatch a worker, request a review, approve, rework, fail, cancel, take a note, update its brief, or mark the goal done.
-4. Merge approved task branches into the goal branch. A conflict becomes rework.
-5. Run the scouts, workers, and reviewers the foreman asked for. At most `max_parallel_workers` workers start.
+3. Ask the foreman for a fenced JSON action list. The foreman chooses whether to scout, create tasks, dispatch a worker, request a review, approve, rework, fail, cancel, take a note, update its brief, or mark the goal done.
+4. Apply state changes, including merging an approved task branch into the goal branch. A conflict becomes rework.
+5. Run the scouts, workers, and reviewers the foreman asked for. At most `max_parallel_workers` of them run at once, and extra dispatches wait for the next turn.
 
-When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. If a tick changes nothing while work is still open, the run stops so it does not call the models forever.
+When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. The run stops at `max_foreman_turns` (default 25), after two foreman failures in a row, or when a turn runs no agents and changes nothing.
 
 Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The foreman and scouts use `--mode ask` and do not edit the tree.
 
@@ -103,7 +103,8 @@ A task that has used `max_attempts` fails instead of starting another attempt.
 | --- | --- |
 | `base_branch` | Branch the pull request targets. `kiln init` uses the current branch. |
 | `verify` | Shell command run in the worktree after a worker finishes. Empty skips it. |
-| `max_parallel_workers` | How many workers one tick may start. Default 2. |
+| `max_parallel_workers` | How many scouts, workers, and reviewers one turn may run at once. Default 2. |
+| `max_foreman_turns` | How many foreman turns one run may take. Default 25. |
 | `max_attempts` | Rework attempts before a task fails. Default 3. |
 | `delete_merged_branches` | Delete a task branch after it merges into the goal branch. Default true. The goal branch stays. |
 | `models.foreman` | Frontier model for planning and review. |

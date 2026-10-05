@@ -151,6 +151,7 @@ def test_dry_run_changes_nothing(factory: Path):
     assert not (factory / "agent-ran").exists()
     assert tasks == []
     assert any("Ship it" in line for line in result.lines)
+    assert any("Turn 1 of 25" in line for line in result.lines)
     assert any("would create branch" in line for line in result.lines)
 
 
@@ -254,6 +255,61 @@ def test_run_until_done_opens_one_pull_request(factory: Path):
     assert "--head\nkiln/goal-1-ship-it" in args
 
 
+def test_turn_cap_stops_after_notes(factory: Path):
+    script = _agent(factory, _note_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        result = run_until_done(conn, config, agent_bin=str(script), turns=2)
+        notes = list_notes(conn, goal.id)
+        status = get_goal_row(conn)
+    finally:
+        conn.close()
+
+    assert len(notes) == 2
+    assert status == GoalStatus.active
+    assert "stopped: reached 2 foreman turns" in result.lines
+
+
+def test_two_foreman_failures_stop_the_run(factory: Path):
+    script = _agent(factory, "print('not a report')\n")
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it")
+        result = run_until_done(conn, config, agent_bin=str(script), turns=5)
+    finally:
+        conn.close()
+
+    failures = [line for line in result.lines if line.startswith("foreman failed")]
+    assert len(failures) == 2
+    assert "stopped: foreman failed twice in a row" in result.lines
+    assert not any("reached" in line for line in result.lines)
+
+
+def test_no_progress_stops_the_run(factory: Path):
+    script = _agent(
+        factory,
+        "import sys\n"
+        "prompt = sys.argv[-1]\n"
+        "if 'You are the Kiln foreman' in prompt:\n"
+        f"    {_emit_call('{\"actions\": []}')}\n",
+    )
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        add_goal(conn, "Ship it")
+        result = run_until_done(conn, config, agent_bin=str(script), turns=5)
+        status = get_goal_row(conn)
+    finally:
+        conn.close()
+
+    assert status == GoalStatus.active
+    assert any("no actions" in line for line in result.lines)
+    assert "stopped: a turn made no progress" in result.lines
+
+
 def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
     script = _agent(
         factory,
@@ -300,6 +356,15 @@ else:
     Path("marker.txt").write_text("ok\\n")
     {_emit_call('{"summary": "added marker", "files": ["marker.txt"]}')}
 """
+
+
+def _note_agent() -> str:
+    return (
+        "import sys\n"
+        "prompt = sys.argv[-1]\n"
+        "if 'You are the Kiln foreman' in prompt:\n"
+        f"    {_emit_call('{\"actions\": [{\"type\": \"note\", \"text\": \"still going\"}]}')}\n"
+    )
 
 
 def _queue_agent() -> str:
