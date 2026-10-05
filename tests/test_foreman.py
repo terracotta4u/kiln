@@ -216,6 +216,7 @@ def _config():
         db_path=root / ".kiln" / "kiln.db",
         toml_path=root / "kiln.toml",
         base_branch="main",
+        harness="cursor",
         verify="",
         max_parallel_workers=2,
         max_attempts=3,

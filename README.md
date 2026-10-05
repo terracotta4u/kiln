@@ -2,11 +2,11 @@
 
 Kiln is a software factory for one git repository. You give it a goal. A foreman decides what happens next: scout, split the work, dispatch a worker, or ask a reviewer to read the diff. Disposable workers do the tasks, each in its own git worktree and branch. Scouts explore the repo and report back. Only workers write code. The foreman, scouts, and reviewer run read-only, and Kiln applies their decisions itself.
 
-Kiln drives the Cursor CLI (`agent`). `kiln run` keeps working until the goal is finished, then opens one pull request.
+Kiln drives Cursor `agent` or OpenAI `codex`. `kiln run` keeps working until the goal is finished, then opens one pull request.
 
 ## Setup
 
-Kiln needs Python 3.12 and [uv](https://docs.astral.sh/uv/). The `agent` command must be on your `PATH`.
+Kiln needs Python 3.12 and [uv](https://docs.astral.sh/uv/). The binary for the harness in `kiln.toml` must be on your `PATH`: `agent` for Cursor, or `codex` for OpenAI.
 
 ```bash
 uv sync
@@ -105,7 +105,7 @@ kiln gc
 
 When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. The body includes the brief, the evidence, and the tasks. The run stops at `max_foreman_turns` (default 25), after two foreman failures in a row, or when a turn runs no agents and changes nothing.
 
-Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The reviewer uses `--mode ask` in that worktree and sees the diff against the goal branch. The foreman and scouts use `--mode ask`.
+Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs the configured harness, commits, and optionally runs the `verify` command. The task then waits in review. With Cursor the worker runs `agent` with `--force --trust`. The reviewer uses `--mode ask` in that worktree and sees the diff against the goal branch. The foreman and scouts use `--mode ask`. With Codex the same roles map to `codex exec --sandbox`: `read-only` for the foreman, scouts, and reviewer, and `workspace-write` for the worker. `--sandbox workspace-write` (used for the worker) may block network access, so commands that fetch dependencies inside the worker (e.g. `uv sync`, `uv run pytest` pulling packages) can fail and should be run with dependencies pre-installed or with network allowed in the Codex config.
 
 A task that has used `max_attempts` fails instead of starting another attempt.
 
@@ -115,6 +115,7 @@ A task that has used `max_attempts` fails instead of starting another attempt.
 
 | Key | Meaning |
 | --- | --- |
+| `harness` | Coding agent CLI. `cursor` runs Cursor `agent`. `codex` runs OpenAI `codex exec`. Default `cursor`. |
 | `base_branch` | Branch the pull request targets. `kiln init` uses the current branch. |
 | `verify` | Shell command run in the worktree after a worker finishes. Empty skips it. |
 | `max_parallel_workers` | How many scouts, workers, and reviewers one turn may run at once. Default 2. |
@@ -126,4 +127,4 @@ A task that has used `max_attempts` fails instead of starting another attempt.
 | `models.scout` | Model for exploration. |
 | `models.reviewer` | Model that reads the diff and returns a verdict. |
 
-The defaults are `claude-opus-5-thinking-high` for the foreman, `claude-sonnet-5-thinking-high` for the worker and the reviewer, and `composer-2.5` for the scout. `KILN_AGENT_BIN` overrides the `agent` executable.
+The defaults are `claude-opus-5-thinking-high` for the foreman, `claude-sonnet-5-thinking-high` for the worker and the reviewer, and `composer-2.5` for the scout. Model names in `[models]` are harness-specific. `KILN_AGENT_BIN` overrides the Cursor `agent` executable. `KILN_CODEX_BIN` overrides the OpenAI `codex` executable.

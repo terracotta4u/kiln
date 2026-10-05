@@ -2,6 +2,7 @@ import json
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,39 @@ def test_scout_requires_a_goal_when_several_are_active(factory):
         conn.close()
 
 
+def test_codex_scout_records_read_only(factory, monkeypatch):
+    capture = factory / "args"
+    monkeypatch.setenv("KILN_CAPTURE_ARGS", str(capture))
+    script = _agent(
+        factory,
+        "import os, pathlib, sys\n"
+        "pathlib.Path(os.environ['KILN_CAPTURE_ARGS']).write_text('\\n'.join(sys.argv[1:]))\n"
+        + _print_report("found it", ["pyproject.toml"], codex=True),
+    )
+    config = replace(load_config(factory), harness="codex")
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it", "A factory")
+        outcome = run_scout(
+            conn,
+            config,
+            "Where is the project file?",
+            goal_id=goal.id,
+            agent_bin=str(script),
+        )
+    finally:
+        conn.close()
+
+    assert outcome.failure is None
+    assert outcome.note is not None
+    assert "found it" in outcome.note.text
+    args = capture.read_text().splitlines()
+    assert args[0] == "exec"
+    assert args[args.index("--sandbox") + 1] == "read-only"
+    log = Path(outcome.run.log_path or "").read_text()
+    assert log.startswith(f"$ {script} exec ")
+
+
 def test_cli_scout(factory, monkeypatch):
     script = _agent(factory, _print_report("cli report", ["src/kiln"]))
     monkeypatch.setenv("KILN_AGENT_BIN", str(script))
@@ -124,14 +158,20 @@ def test_cli_scout(factory, monkeypatch):
     assert "note #1" in result.output
 
 
-def _print_report(summary: str, findings: list[str]) -> str:
-    envelope = {
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "```json\n" + json.dumps({"summary": summary, "findings": findings}) + "\n```",
-    }
-    return "print(" + json.dumps(json.dumps(envelope)) + ")\n"
+def _print_report(summary: str, findings: list[str], *, codex: bool = False) -> str:
+    fenced = "```json\n" + json.dumps({"summary": summary, "findings": findings}) + "\n```"
+    if codex:
+        printed = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "item_0", "type": "agent_message", "text": fenced},
+            }
+        )
+    else:
+        printed = json.dumps(
+            {"type": "result", "subtype": "success", "is_error": False, "result": fenced}
+        )
+    return "print(" + json.dumps(printed) + ")\n"
 
 
 def _agent(directory: Path, body: str) -> Path:

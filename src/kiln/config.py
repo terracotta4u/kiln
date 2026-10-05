@@ -13,6 +13,8 @@ DEFAULT_REVIEWER_MODEL = "claude-sonnet-5-thinking-high"
 DEFAULT_MAX_PARALLEL_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_FOREMAN_TURNS = 25
+DEFAULT_HARNESS = "cursor"
+SUPPORTED_HARNESSES = ("cursor", "codex")
 
 KILN_DIRNAME = ".kiln"
 CONFIG_FILENAME = "kiln.toml"
@@ -34,6 +36,7 @@ class Config:
     db_path: Path
     toml_path: Path
     base_branch: str
+    harness: str
     verify: str
     max_parallel_workers: int
     max_attempts: int
@@ -116,6 +119,7 @@ def _config_from_data(root: Path, toml_path: Path, data: dict) -> Config:
         db_path=kiln_dir / DB_FILENAME,
         toml_path=toml_path,
         base_branch=_require_str(data, "base_branch"),
+        harness=_optional_harness(data),
         verify=_require_str(data, "verify", allow_empty=True),
         max_parallel_workers=_require_positive_int(data, "max_parallel_workers"),
         max_attempts=_require_positive_int(data, "max_attempts"),
@@ -145,6 +149,15 @@ def _require_bool(data: dict, key: str) -> bool:
     return value
 
 
+def _optional_harness(data: dict) -> str:
+    if "harness" not in data:
+        return DEFAULT_HARNESS
+    value = data["harness"]
+    if isinstance(value, str) and value in SUPPORTED_HARNESSES:
+        return value
+    raise KilnError('kiln.toml harness must be "cursor" or "codex"')
+
+
 def _optional_str(data: dict, key: str, default: str, *, label: str | None = None) -> str:
     if key not in data:
         return default
@@ -171,6 +184,9 @@ def _toml_string(value: str) -> str:
 
 def _toml_template(base_branch: str) -> str:
     return f"""# Kiln factory settings for this repository.
+
+# Coding agent CLI Kiln drives: "cursor" (Cursor `agent`) or "codex" (OpenAI `codex exec`).
+harness = {_toml_string(DEFAULT_HARNESS)}
 
 # Branch the pull request targets.
 base_branch = {_toml_string(base_branch)}
