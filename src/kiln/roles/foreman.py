@@ -35,6 +35,7 @@ from kiln.tasks import (
 
 _OPEN = {TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review}
 _AGENT_TYPES = frozenset({"scout", "dispatch", "review"})
+_DECISIONS = frozenset({"approve", "rework", "fail"})
 _NOTE_LIMIT = 2000
 
 
@@ -197,9 +198,16 @@ def apply_actions(
         refs.setdefault(task.title, task.id)
     limit = config.max_parallel_workers if worker_limit is None else worker_limit
     indexed = list(enumerate(actions, start=1))
+    conflicts = _same_turn_conflicts(actions, refs)
     messages: dict[int, str] = {}
+    agents: list[tuple[int, dict]] = []
     for index, action in indexed:
+        refusal = _same_turn_refusal(action, refs, conflicts)
+        if refusal:
+            messages[index] = _record_action(conn, f"action {index} failed: {refusal}")
+            continue
         if _is_agent(action):
+            agents.append((index, action))
             continue
         messages[index] = _record_action(
             conn,
@@ -217,7 +225,7 @@ def apply_actions(
     agents_ran = _run_agents(
         config,
         goal,
-        [(index, action) for index, action in indexed if _is_agent(action)],
+        agents,
         messages,
         refs,
         db_path=_database_path(conn),
@@ -230,6 +238,54 @@ def apply_actions(
 
 def _is_agent(action: object) -> bool:
     return isinstance(action, dict) and action.get("type") in _AGENT_TYPES
+
+
+def _same_turn_conflicts(actions: list[dict], refs: dict[str, int]) -> set[object]:
+    """Tasks that this list both reviews and approves, reworks, or fails.
+
+    Those decisions run before the reviewer, so the verdict cannot inform them.
+    """
+    reviewed: set[object] = set()
+    decided: set[object] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        key = _task_key(action, refs)
+        if key is None:
+            continue
+        kind = action.get("type")
+        if kind == "review":
+            reviewed.add(key)
+        elif kind in _DECISIONS:
+            decided.add(key)
+    return reviewed & decided
+
+
+def _task_key(action: dict, refs: dict[str, int]) -> object | None:
+    if "task_id" in action and action.get("task_id") is not None:
+        value = action["task_id"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+    ref = action.get("ref")
+    if isinstance(ref, str) and ref.strip():
+        name = ref.strip()
+        if name in refs:
+            return refs[name]
+        return ("ref", name)
+    return None
+
+
+def _same_turn_refusal(action: object, refs: dict[str, int], conflicts: set[object]) -> str | None:
+    if not isinstance(action, dict):
+        return None
+    if action.get("type") not in {"review", *_DECISIONS}:
+        return None
+    key = _task_key(action, refs)
+    if key not in conflicts:
+        return None
+    label = f"#{key}" if isinstance(key, int) else repr(key[1])
+    return f"cannot review and approve, rework, or fail task {label} in one turn"
 
 
 def _attempt(

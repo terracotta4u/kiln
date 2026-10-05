@@ -119,6 +119,41 @@ def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
     conn.close()
 
 
+def test_review_and_a_decision_in_one_turn_are_refused(tmp_path):
+    conn = _db(tmp_path)
+    goal = add_goal(conn, "Ship it")
+    first = add_task(conn, goal.id, "Schema")
+    second = add_task(conn, goal.id, "CLI")
+    third = add_task(conn, goal.id, "Docs")
+    set_task_status(conn, first.id, TaskStatus.review)
+    set_task_status(conn, second.id, TaskStatus.review)
+    set_task_status(conn, third.id, TaskStatus.review)
+    messages = apply_actions(
+        conn,
+        _config(),
+        goal,
+        [
+            {"type": "review", "task_id": first.id},
+            {"type": "approve", "task_id": first.id},
+            {"type": "note", "text": "still here"},
+            {"type": "rework", "task_id": second.id, "feedback": "split the command"},
+            {"type": "review", "task_id": second.id},
+            {"type": "fail", "task_id": third.id, "reason": "wrong approach"},
+        ],
+    )
+    assert messages[0] == f"action 1 failed: cannot review and approve, rework, or fail task #{first.id} in one turn"
+    assert messages[1] == f"action 2 failed: cannot review and approve, rework, or fail task #{first.id} in one turn"
+    assert messages[2].startswith("note #")
+    assert messages[3] == f"action 4 failed: cannot review and approve, rework, or fail task #{second.id} in one turn"
+    assert messages[4] == f"action 5 failed: cannot review and approve, rework, or fail task #{second.id} in one turn"
+    assert messages[5] == f"task #{third.id} failed"
+    stored = [get_task(conn, task_id) for task_id in (first.id, second.id, third.id)]
+    assert stored[0] is not None and stored[0].status == TaskStatus.review
+    assert stored[1] is not None and stored[1].status == TaskStatus.review
+    assert stored[2] is not None and stored[2].status == TaskStatus.failed
+    conn.close()
+
+
 def test_goal_brief_shows_the_brief_and_what_is_ready(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")

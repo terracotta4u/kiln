@@ -94,7 +94,7 @@ kiln gc
 | `create_task` | Add a task. `ref` names it for later actions in the same list. `depends_on` takes refs or task ids. `priority` is an integer; higher values are scheduled first. |
 | `scout` | Explore the repo and answer `question`. The note is in the next turn's state. |
 | `dispatch` | Run a worker on a ready pending task, by `task_id` or `ref`. |
-| `review` | Run the reviewer on a task in review. `focus` is optional. |
+| `review` | Run the reviewer on a task in review. `focus` is optional. The verdict arrives next turn. Kiln refuses a list that also approves, reworks, or fails that same task. |
 | `approve` | Merge a task in review into the goal branch. |
 | `rework` | Send a task in review back to pending with `feedback`. |
 | `fail` | Fail a task. `reason` is optional. |
