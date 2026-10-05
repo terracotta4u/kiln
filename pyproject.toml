@@ -1,17 +1,32 @@
 [project]
 name = "kiln"
 version = "0.1.0"
-description = "Add your description here"
+description = "An automated software factory: one foreman, disposable workers, one repo."
 readme = "README.md"
 authors = [
     { name = "Nawaz Gafar", email = "nawaz@terracotta4u.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "typer>=0.12",
+]
 
 [project.scripts]
-kiln = "kiln:main"
+kiln = "kiln.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "kiln"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

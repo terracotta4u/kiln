@@ -1,0 +1,169 @@
+import subprocess
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from kiln.cli import app
+from kiln.config import load_config
+from kiln.errors import KilnError
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch) -> Path:
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_init_writes_config_database_and_gitignore(repo):
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+    assert (repo / "kiln.toml").is_file()
+    assert (repo / ".kiln" / "kiln.db").is_file()
+    assert ".kiln/" in (repo / ".gitignore").read_text()
+
+    config = load_config(repo)
+    assert config.base_branch == "main"
+    assert config.models.foreman == "claude-opus-5-thinking-high"
+    assert config.max_attempts == 3
+
+    original = (repo / "kiln.toml").read_text()
+    again = runner.invoke(app, ["init"])
+    assert again.exit_code == 0
+    assert "left unchanged" in again.output
+    assert (repo / "kiln.toml").read_text() == original
+
+
+def test_init_appends_gitignore_without_clobbering(repo):
+    (repo / ".gitignore").write_text("dist\n")
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+    assert (repo / ".gitignore").read_text() == "dist\n.kiln/\n"
+
+
+def test_init_outside_a_git_repo_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code != 0
+    assert "git repository" in result.output
+
+
+def test_goal_and_task_flow(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    toml = (repo / "kiln.toml").read_text().replace("max_attempts = 3", "max_attempts = 7")
+    (repo / "kiln.toml").write_text(toml)
+
+    created = runner.invoke(app, ["goal", "add", "Ship it", "--description", "A factory"])
+    assert created.exit_code == 0, created.output
+    assert "goal #1" in created.output
+
+    listed = runner.invoke(app, ["goal", "list"])
+    assert "#1  active  Ship it" in listed.output
+
+    first = runner.invoke(app, ["task", "add", "1", "Schema", "--priority", "1"])
+    second = runner.invoke(
+        app,
+        ["task", "add", "1", "CLI", "--depends-on", "1", "--acceptance", "commands work"],
+    )
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+
+    cycle = runner.invoke(app, ["task", "dep", "1", "2"])
+    assert cycle.exit_code != 0
+    assert "cycle" in cycle.output
+
+    pending = runner.invoke(app, ["task", "list", "--status", "pending"])
+    assert "Schema" in pending.output
+    assert "deps: #1" in pending.output
+
+    shown = runner.invoke(app, ["task", "show", "2"])
+    assert shown.exit_code == 0, shown.output
+    assert "attempts    0/7" in shown.output
+    assert "commands work" in shown.output
+
+    dashboard = runner.invoke(app, ["status"])
+    assert dashboard.exit_code == 0, dashboard.output
+    assert "Ship it" in dashboard.output
+    assert "Schema" in dashboard.output
+    assert "blocked" in dashboard.output
+
+    missing = runner.invoke(app, ["goal", "show", "9"])
+    assert missing.exit_code != 0
+    assert "no goal with id 9" in missing.output
+
+    cancelled = runner.invoke(app, ["task", "cancel", "2"])
+    assert cancelled.exit_code == 0, cancelled.output
+    assert "cancelled #2" in cancelled.output
+
+
+def test_commands_require_init(repo):
+    for args in (["status"], ["log"], ["gc"], ["runs", "show", "1"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code != 0
+        assert "kiln init" in result.output
+
+
+def test_log_and_runs_show(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    empty = runner.invoke(app, ["log"])
+    assert empty.exit_code == 0, empty.output
+    assert "no events" in empty.output
+
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    assert runner.invoke(app, ["task", "add", "1", "Schema"]).exit_code == 0
+    logged = runner.invoke(app, ["log"])
+    assert logged.exit_code == 0, logged.output
+    assert logged.output.index("goal.created") < logged.output.index("task.created")
+    assert "task #1" in logged.output
+
+    latest = runner.invoke(app, ["log", "-n", "1"])
+    assert "task.created" in latest.output
+    assert "goal.created" not in latest.output
+
+    rejected = runner.invoke(app, ["log", "-n", "0"])
+    assert rejected.exit_code != 0
+    assert "limit" in rejected.output
+
+    from kiln.db import connect
+    from kiln.models import RunStatus
+    from kiln.runs import finish_run, start_run
+
+    config = load_config(repo)
+    conn = connect(config.db_path)
+    try:
+        run = start_run(conn, role="scout", model="composer-2.5")
+        log_path = config.runs_dir / f"{run.id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("".join(f"line {index}\n" for index in range(45)))
+        finish_run(
+            conn,
+            run.id,
+            status=RunStatus.succeeded,
+            exit_code=0,
+            log_path=str(log_path),
+            report={"summary": "readme exists"},
+        )
+    finally:
+        conn.close()
+
+    shown = runner.invoke(app, ["runs", "show", "1"])
+    assert shown.exit_code == 0, shown.output
+    assert "composer-2.5" in shown.output
+    assert "readme exists" in shown.output
+    assert "task        (none)" in shown.output
+    assert "... 5 earlier lines" in shown.output
+    assert "line 44" in shown.output
+    assert "line 0\n" not in shown.output
+
+    missing = runner.invoke(app, ["runs", "show", "9"])
+    assert missing.exit_code != 0
+    assert "no run with id 9" in missing.output
+
+
+def test_invalid_config_is_rejected(repo):
+    (repo / "kiln.toml").write_text('base_branch = "main"\n')
+    with pytest.raises(KilnError, match="models"):
+        load_config(repo)
