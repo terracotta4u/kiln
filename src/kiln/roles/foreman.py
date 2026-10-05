@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiln.agent import DEFAULT_TIMEOUT_SECONDS, run_agent
+from kiln.agent import DEFAULT_TIMEOUT_SECONDS, get_harness, run_agent
 from kiln.config import Config
 from kiln.db import connect, migrate, record_event
 from kiln.errors import KilnError
@@ -135,9 +135,10 @@ def run_foreman(
             model=config.models.foreman,
             workspace=config.repo_root,
             log_path=log_path,
-            mode="ask",
             timeout=timeout,
             agent_bin=agent_bin,
+            harness=get_harness(config.harness),
+            readonly=True,
         )
     except KilnError as exc:
         finished = finish_run(

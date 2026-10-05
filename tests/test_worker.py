@@ -2,6 +2,7 @@ import json
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -213,6 +214,28 @@ def test_missing_base_branch_releases_the_claim(factory: Path):
     assert stored.claimed_by is None
 
 
+def test_codex_worker_records_workspace_write(factory: Path, monkeypatch: pytest.MonkeyPatch):
+    capture = factory / "args"
+    monkeypatch.setenv("KILN_CAPTURE_ARGS", str(capture))
+    script = _agent(factory, _write_and_report("added hello", "hello.txt", codex=True))
+    config = replace(load_config(factory), harness="codex")
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        add_task(conn, goal.id, "Add hello")
+        outcome = run_worker(conn, config, agent_bin=str(script))
+    finally:
+        conn.close()
+
+    assert outcome.failure is None
+    assert outcome.summary == "added hello"
+    args = capture.read_text().splitlines()
+    assert args[0] == "exec"
+    assert args[args.index("--sandbox") + 1] == "workspace-write"
+    log = Path(outcome.run.log_path or "").read_text()
+    assert log.startswith(f"$ {script} exec ")
+
+
 def test_cli_work(factory: Path, monkeypatch: pytest.MonkeyPatch):
     script = _agent(factory, _write_and_report("from the cli", "hello.txt"))
     monkeypatch.setenv("KILN_AGENT_BIN", str(script))
@@ -228,28 +251,35 @@ def test_cli_work(factory: Path, monkeypatch: pytest.MonkeyPatch):
     assert "no ready task" in again.output
 
 
-def _write_and_report(summary: str, filename: str) -> str:
+def _write_and_report(summary: str, filename: str, *, codex: bool = False) -> str:
     return (
         "from pathlib import Path\n"
         f"Path({filename!r}).write_text('hello\\n')\n"
-        + _print_report(summary, [filename])
+        + _print_report(summary, [filename], codex=codex)
     )
 
 
-def _print_report(summary: str, files: list[str]) -> str:
-    envelope = {
-        "type": "result",
-        "subtype": "success",
-        "is_error": False,
-        "result": "```json\n" + json.dumps({"summary": summary, "files": files}) + "\n```",
-    }
+def _print_report(summary: str, files: list[str], *, codex: bool = False) -> str:
+    payload = {"summary": summary, "files": files}
+    fenced = "```json\n" + json.dumps(payload) + "\n```"
+    if codex:
+        printed = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "item_0", "type": "agent_message", "text": fenced},
+            }
+        )
+    else:
+        printed = json.dumps(
+            {"type": "result", "subtype": "success", "is_error": False, "result": fenced}
+        )
     saving = (
         "import os, pathlib, sys\n"
         "path = os.environ.get('KILN_CAPTURE_ARGS')\n"
         "if path:\n"
         "    pathlib.Path(path).write_text('\\n'.join(sys.argv[1:]))\n"
     )
-    return saving + "print(" + json.dumps(json.dumps(envelope)) + ")\n"
+    return saving + "print(" + json.dumps(printed) + ")\n"
 
 
 def _agent(directory: Path, body: str) -> Path:

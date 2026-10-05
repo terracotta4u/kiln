@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiln.agent import DEFAULT_TIMEOUT_SECONDS, AgentResult, run_agent
+from kiln.agent import DEFAULT_TIMEOUT_SECONDS, AgentResult, get_harness, run_agent
 from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
@@ -91,9 +91,10 @@ def run_worker(
             model=config.models.worker,
             workspace=worktree,
             log_path=config.runs_dir / f"{run.id}.log",
-            force=True,
             timeout=timeout,
             agent_bin=agent_bin,
+            harness=get_harness(config.harness),
+            readonly=False,
         )
     except KilnError as exc:
         failure = str(exc)

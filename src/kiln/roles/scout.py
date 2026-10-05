@@ -2,7 +2,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from kiln.agent import DEFAULT_TIMEOUT_SECONDS, AgentResult, run_agent
+from kiln.agent import DEFAULT_TIMEOUT_SECONDS, AgentResult, get_harness, run_agent
 from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
@@ -55,9 +55,10 @@ def run_scout(
             model=config.models.scout,
             workspace=config.repo_root,
             log_path=log_path,
-            mode="ask",
             timeout=timeout,
             agent_bin=agent_bin,
+            harness=get_harness(config.harness),
+            readonly=True,
         )
     except KilnError:
         finish_run(
