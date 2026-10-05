@@ -29,23 +29,23 @@ kiln goal add "Add a health check" --description "GET /health returns 200"
 kiln run
 ```
 
-`kiln run` creates a branch for the goal (`kiln/goal-<id>-<slug>`), scouts, asks the foreman to break the goal into tasks, and dispatches workers. Each approved task is merged onto that goal branch as soon as it passes review. When nothing is left to do, Kiln pushes the branch to `origin` and opens one pull request into `base_branch`.
+`kiln run` creates a branch for the goal (`kiln/goal-<id>-<slug>`). The foreman decides whether to scout, split the goal into tasks, and dispatch workers. Each approved task is merged onto that goal branch. When nothing is left to do, Kiln pushes the branch to `origin` and opens one pull request into `base_branch`. The pull request includes the brief and the evidence.
 
 A task is ready when it is pending and every dependency is done. Done means the task branch has been merged into the goal branch.
 
 The repository needs an `origin` remote and the GitHub CLI (`gh`) so the pull request can be opened.
 
 ```bash
-kiln run --dry-run      # print one tick; change nothing
-kiln run --no-dispatch  # one tick: scout, plan, and merge; skip workers
-kiln run --workers 1    # cap how many workers a tick starts
+kiln run --dry-run      # print the state the foreman would see; change nothing
+kiln run --turns 1      # one foreman turn, then stop
+kiln run --workers 1    # cap how many agents a turn runs at once
 ```
 
 ## Looking around
 
 ```bash
 kiln status
-kiln goal show 1
+kiln goal show 1     # brief, evidence, and tasks
 kiln task list
 kiln task show 1
 kiln log            # recent events, oldest first
@@ -73,7 +73,7 @@ kiln review 1 --fail --reason "Wrong approach"
 
 ## Cleanup
 
-Finished tasks (done, failed, cancelled) do not need a checkout. `kiln gc` removes their worktrees, and deletes a done task's branch when `delete_merged_branches` is true. Failed and cancelled branches stay, so the commits can still be inspected. Tasks that are pending, claimed, running, or in review are left alone. `kiln run` does this sweep at the start of a real tick.
+Finished tasks (done, failed, cancelled) do not need a checkout. `kiln gc` removes their worktrees, and deletes a done task's branch when `delete_merged_branches` is true. Failed and cancelled branches stay, so the commits can still be inspected. Tasks that are pending, claimed, running, or in review are left alone. `kiln run` does this sweep at the start of a turn.
 
 ```bash
 kiln gc

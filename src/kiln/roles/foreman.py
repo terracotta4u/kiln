@@ -186,7 +186,6 @@ def apply_actions(
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
     worker_limit: int | None = None,
-    allow_dispatch: bool = True,
 ) -> AppliedActions:
     """Apply foreman decisions. One bad action does not discard the rest.
 
@@ -223,7 +222,6 @@ def apply_actions(
         refs,
         db_path=_database_path(conn),
         limit=limit,
-        allow_dispatch=allow_dispatch,
         agent_bin=agent_bin,
         reporter=reporter,
     )
@@ -273,7 +271,6 @@ def _run_agents(
     *,
     db_path: Path,
     limit: int,
-    allow_dispatch: bool,
     agent_bin: str | None,
     reporter: Callable[[str], None] | None,
 ) -> int:
@@ -285,9 +282,6 @@ def _run_agents(
         for index, action in actions:
             if action.get("type") != "dispatch":
                 pending.append((index, action))
-                continue
-            if not allow_dispatch:
-                messages[index] = _record_action(holder, "dispatch skipped")
                 continue
             if dispatched >= limit:
                 messages[index] = _record_action(holder, "limit reached, dispatch next turn")

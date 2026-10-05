@@ -65,6 +65,12 @@ def test_goal_and_task_flow(repo):
     listed = runner.invoke(app, ["goal", "list"])
     assert "#1  active  Ship it" in listed.output
 
+    shown_goal = runner.invoke(app, ["goal", "show", "1"])
+    assert shown_goal.exit_code == 0, shown_goal.output
+    assert "A factory" in shown_goal.output
+    assert "\nbrief\n(none)" in shown_goal.output
+    assert "\nevidence\n(none)" in shown_goal.output
+
     first = runner.invoke(app, ["task", "add", "1", "Schema", "--priority", "1"])
     second = runner.invoke(
         app,
@@ -163,6 +169,27 @@ def test_log_and_runs_show(repo):
     missing = runner.invoke(app, ["runs", "show", "9"])
     assert missing.exit_code != 0
     assert "no run with id 9" in missing.output
+
+
+def test_goal_show_prints_brief_and_evidence(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    from kiln.db import connect
+    from kiln.tasks import set_goal_brief, set_goal_evidence
+
+    config = load_config(repo)
+    conn = connect(config.db_path)
+    try:
+        set_goal_brief(conn, 1, "Success: the marker exists.")
+        set_goal_evidence(conn, 1, ["pytest passed", "review found no blockers"])
+    finally:
+        conn.close()
+
+    shown = runner.invoke(app, ["goal", "show", "1"])
+    assert shown.exit_code == 0, shown.output
+    assert "Success: the marker exists." in shown.output
+    assert "- pytest passed" in shown.output
+    assert "- review found no blockers" in shown.output
 
 
 def test_missing_optional_settings_use_defaults(repo):

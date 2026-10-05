@@ -124,9 +124,9 @@ def test_scout_action_runs_during_the_tick(factory: Path):
     try:
         goal = add_goal(conn, "Ship it")
         add_task(conn, goal.id, "Existing")
-        first = run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        first = run_tick(conn, config, agent_bin=str(script))
         notes_after_first = list_notes(conn, goal.id)
-        second = run_tick(conn, config, agent_bin=str(script), dispatch=False)
+        second = run_tick(conn, config, agent_bin=str(script))
         notes = list_notes(conn, goal.id)
     finally:
         conn.close()
@@ -153,22 +153,6 @@ def test_dry_run_changes_nothing(factory: Path):
     assert any("Ship it" in line for line in result.lines)
     assert any("Turn 1 of 25" in line for line in result.lines)
     assert any("would create branch" in line for line in result.lines)
-
-
-def test_no_dispatch_leaves_the_task_pending(factory: Path):
-    script = _agent(factory, _smart_agent())
-    config = load_config(factory)
-    conn = connect(config.db_path)
-    try:
-        add_goal(conn, "Ship it")
-        run_tick(conn, config, agent_bin=str(script), dispatch=False)
-        tasks = list_tasks(conn)
-    finally:
-        conn.close()
-
-    assert len(tasks) == 1
-    assert tasks[0].status == TaskStatus.pending
-    assert not (factory / ".kiln" / "worktrees").exists()
 
 
 def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
@@ -253,6 +237,8 @@ def test_run_until_done_opens_one_pull_request(factory: Path):
     assert "pr\ncreate" in args
     assert "--base\nmain" in args
     assert "--head\nkiln/goal-1-ship-it" in args
+    assert "Brief:\n(none)" in args
+    assert "Evidence:\n(none)" in args
 
 
 def test_turn_cap_stops_after_notes(factory: Path):
@@ -308,6 +294,31 @@ def test_no_progress_stops_the_run(factory: Path):
     assert status == GoalStatus.active
     assert any("no actions" in line for line in result.lines)
     assert "stopped: a turn made no progress" in result.lines
+
+
+def test_cli_run_turns_dry_run_and_drops_no_dispatch(factory: Path, monkeypatch: pytest.MonkeyPatch):
+    script = _agent(factory, _note_agent())
+    monkeypatch.setenv("KILN_AGENT_BIN", str(script))
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+
+    dry = runner.invoke(app, ["run", "--dry-run", "--turns", "3"])
+    assert dry.exit_code == 0, dry.output
+    assert "Turn 1 of 3" in dry.output
+    assert "would create branch" in dry.output
+
+    capped = runner.invoke(app, ["run", "--turns", "2"])
+    assert capped.exit_code == 0, capped.output
+    assert "stopped: reached 2 foreman turns" in capped.output
+    assert "note #1" in capped.output
+    assert "note #2" in capped.output
+
+    rejected = runner.invoke(app, ["run", "--turns", "0"])
+    assert rejected.exit_code != 0
+    assert "turns must be >= 1" in rejected.output
+
+    removed = runner.invoke(app, ["run", "--no-dispatch"])
+    assert removed.exit_code != 0
+    assert "No such option" in removed.output
 
 
 def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):

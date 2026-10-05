@@ -25,7 +25,6 @@ def run_turn(
     goal: Goal,
     *,
     workers: int | None = None,
-    dispatch: bool = True,
     turn: int = 1,
     turn_cap: int | None = None,
     agent_bin: str | None = None,
@@ -67,7 +66,6 @@ def run_turn(
         agent_bin=agent_bin,
         reporter=reporter,
         worker_limit=limit,
-        allow_dispatch=dispatch,
     )
     result.lines.extend(applied)
     result.agents_ran = applied.agents_ran
@@ -79,8 +77,8 @@ def run_tick(
     config: Config,
     *,
     workers: int | None = None,
-    dispatch: bool = True,
     dry_run: bool = False,
+    turn_cap: int | None = None,
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
 ) -> TickResult:
@@ -106,7 +104,7 @@ def run_tick(
                     goal,
                     worker_limit=limit,
                     turn=1,
-                    turn_cap=config.max_foreman_turns,
+                    turn_cap=config.max_foreman_turns if turn_cap is None else turn_cap,
                 )
             )
         return result
@@ -117,7 +115,7 @@ def run_tick(
             config,
             goal,
             workers=limit,
-            dispatch=dispatch,
+            turn_cap=turn_cap,
             agent_bin=agent_bin,
             reporter=reporter,
         )

@@ -127,27 +127,37 @@ def run(
         None,
         "--workers",
         "-w",
-        help="How many workers to dispatch. Defaults to max_parallel_workers in kiln.toml.",
+        help="How many scouts, workers, and reviewers may run at once. Defaults to max_parallel_workers.",
     ),
-    no_dispatch: bool = typer.Option(False, "--no-dispatch", help="Do not start workers."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the tick and change nothing."),
+    turns: int | None = typer.Option(
+        None,
+        "--turns",
+        help="Stop after this many foreman turns. Defaults to max_foreman_turns.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the state the foreman would see and change nothing.",
+    ),
 ) -> None:
     """Run until every active goal is finished, then open a pull request."""
 
     def render(config: Config, conn) -> None:
-        if dry_run or no_dispatch:
+        if turns is not None and turns < 1:
+            raise KilnError("turns must be >= 1")
+        if dry_run:
             outcome = run_tick(
                 conn,
                 config,
                 workers=workers,
-                dispatch=not no_dispatch,
-                dry_run=dry_run,
+                dry_run=True,
+                turn_cap=turns,
                 reporter=typer.echo,
             )
             for line in outcome.lines:
                 typer.echo(line)
             return
-        run_until_done(conn, config, workers=workers, reporter=typer.echo)
+        run_until_done(conn, config, workers=workers, turns=turns, reporter=typer.echo)
 
     _with_db(render)
 
@@ -465,6 +475,14 @@ def _echo_goal(goal: Goal) -> None:
         typer.echo(f"pull request {goal.pr_url}")
     typer.echo("\ndescription")
     typer.echo(goal.description or "(none)")
+    typer.echo("\nbrief")
+    typer.echo(goal.brief or "(none)")
+    typer.echo("\nevidence")
+    if not goal.evidence:
+        typer.echo("(none)")
+    else:
+        for item in goal.evidence:
+            typer.echo(f"- {item}")
 
 
 def _echo_task_lines(tasks: list[Task]) -> None:

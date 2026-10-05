@@ -142,7 +142,19 @@ def _mark_published(conn: sqlite3.Connection, goal: Goal, url: str) -> None:
 
 
 def _pull_request_body(conn: sqlite3.Connection, goal: Goal) -> str:
-    lines = [goal.description.strip() or goal.title, "", "Tasks:"]
+    lines = [
+        goal.description.strip() or goal.title,
+        "",
+        "Brief:",
+        goal.brief.strip() if goal.brief else "(none)",
+        "",
+        "Evidence:",
+    ]
+    if goal.evidence:
+        lines.extend(f"- {item}" for item in goal.evidence)
+    else:
+        lines.append("(none)")
+    lines.extend(["", "Tasks:"])
     for task in list_tasks(conn, goal_id=goal.id):
         lines.append(f"- #{task.id} [{task.status.value}] {task.title}")
     return "\n".join(lines).strip() + "\n"
