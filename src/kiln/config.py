@@ -178,7 +178,7 @@ base_branch = {_toml_string(base_branch)}
 # Command run in the worktree after a worker finishes. Empty skips verification.
 verify = ""
 
-# How many workers `kiln run` may dispatch in one tick.
+# How many scouts, workers, and reviewers one turn may run at once.
 max_parallel_workers = {DEFAULT_MAX_PARALLEL_WORKERS}
 
 # Rework attempts before a task is failed.

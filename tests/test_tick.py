@@ -14,7 +14,7 @@ from kiln.models import GoalStatus, TaskStatus
 from kiln.notes import list_notes
 from kiln.roles.worker import run_worker
 from kiln.review import approve_task
-from kiln.tasks import add_goal, add_task, get_task, list_tasks
+from kiln.tasks import add_goal, add_task, get_task, list_tasks, require_goal
 from kiln.tick import run_tick, run_until_done
 
 runner = CliRunner()
@@ -33,7 +33,7 @@ def factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
+def test_turns_dispatch_review_then_finish(factory: Path):
     script = _agent(factory, _smart_agent())
     config = load_config(factory)
     conn = connect(config.db_path)
@@ -43,8 +43,10 @@ def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
         task = list_tasks(conn)[0]
         on_main_after_work = (factory / "marker.txt").exists()
         second = run_tick(conn, config, agent_bin=str(script))
+        reviewed = get_task(conn, task.id)
+        third = run_tick(conn, config, agent_bin=str(script))
         stored = get_task(conn, task.id)
-        goal = get_goal_row(conn)
+        goal = require_goal(conn, 1)
     finally:
         conn.close()
 
@@ -52,8 +54,9 @@ def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
     assert any("task #1  review" in line for line in first.lines)
     assert task.status == TaskStatus.review
     assert on_main_after_work is False
-    assert stored is not None
-    assert stored.status == TaskStatus.done
+    assert reviewed is not None and reviewed.status == TaskStatus.review
+    assert any("reviewed #1: approve" in line for line in second.lines)
+    assert stored is not None and stored.status == TaskStatus.done
     assert not (factory / "marker.txt").exists()
     marker = subprocess.run(
         ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
@@ -63,14 +66,17 @@ def test_tick_scouts_plans_and_the_next_tick_merges(factory: Path):
         text=True,
     )
     assert marker.stdout == "ok\n"
-    assert any("merged into kiln/goal-1-ship-it" in line for line in second.lines)
+    assert any("merged into kiln/goal-1-ship-it" in line for line in third.lines)
+    assert any("goal #1 done" in line for line in third.lines)
     assert not (factory / ".kiln" / "worktrees" / "1").exists()
     missing = subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/kiln/1-add-marker"],
         cwd=factory,
     )
     assert missing.returncode != 0
-    assert goal == GoalStatus.active
+    assert goal.status == GoalStatus.done
+    assert goal.brief == "Success: marker.txt exists."
+    assert goal.evidence == ("marker.txt is ok on the goal branch",)
 
 
 def test_conflict_sends_the_task_back_for_rework(factory: Path):
@@ -237,8 +243,12 @@ def test_run_until_done_opens_one_pull_request(factory: Path):
     assert "pr\ncreate" in args
     assert "--base\nmain" in args
     assert "--head\nkiln/goal-1-ship-it" in args
-    assert "Brief:\n(none)" in args
-    assert "Evidence:\n(none)" in args
+    assert stored.brief == "Success: marker.txt exists."
+    assert stored.evidence == ("marker.txt is ok on the goal branch",)
+    assert "Success: marker.txt exists." in args
+    assert "- marker.txt is ok on the goal branch" in args
+    assert any("reviewed #1: approve" in line for line in result.lines)
+    assert any("goal #1 done" in line for line in result.lines)
 
 
 def test_turn_cap_stops_after_notes(factory: Path):
@@ -354,9 +364,13 @@ from pathlib import Path
 prompt = sys.argv[-1]
 if "You are a scout" in prompt:
     {_emit_call('{"summary": "repo has a readme", "findings": ["README.md"]}')}
+elif "You are a Kiln reviewer" in prompt:
+    {_emit_call('{"verdict": "approve", "summary": "marker is one line", "findings": ["file exists"], "confidence": 0.9}')}
 elif "You are the Kiln foreman" in prompt:
-    if "[review]" in prompt:
-        {_emit_call('{"actions": [{"type": "approve", "task_id": 1}]}')}
+    if "[review]" in prompt and "marker is one line" in prompt:
+        {_emit_call('{"actions": [{"type": "approve", "task_id": 1}, {"type": "update_brief", "text": "Success: marker.txt exists."}, {"type": "goal_done", "evidence": ["marker.txt is ok on the goal branch"]}]}')}
+    elif "[review]" in prompt:
+        {_emit_call('{"actions": [{"type": "review", "task_id": 1, "focus": "marker.txt is one line"}]}')}
     elif "Tasks:\\n(none)" in prompt:
         {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}, {"type": "dispatch", "ref": "marker"}]}')}
     elif "[pending]" in prompt:

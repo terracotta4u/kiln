@@ -1,6 +1,6 @@
 # Kiln
 
-Kiln is a software factory for one git repository. You give it a goal. A foreman plans and reviews. Disposable workers do the tasks, each in its own git worktree and branch. Scouts explore the repo and report back. Only workers write code. The foreman and scouts run read-only, and Kiln applies their decisions itself.
+Kiln is a software factory for one git repository. You give it a goal. A foreman decides what happens next: scout, split the work, dispatch a worker, or ask a reviewer to read the diff. Disposable workers do the tasks, each in its own git worktree and branch. Scouts explore the repo and report back. Only workers write code. The foreman, scouts, and reviewer run read-only, and Kiln applies their decisions itself.
 
 Kiln drives the Cursor CLI (`agent`). `kiln run` keeps working until the goal is finished, then opens one pull request.
 
@@ -81,17 +81,31 @@ kiln gc
 
 ## What a run does
 
-`kiln run` repeats a turn until every active goal is finished. Each turn asks the foreman once:
+`kiln run` repeats a turn until every active goal is finished. Each turn asks the foreman once. The state it sees includes the brief, the turn number, which tasks are ready or blocked, and the latest review.
 
 1. Remove leftover worktrees from finished tasks.
 2. Create the goal branch from `base_branch` if it does not exist yet.
-3. Ask the foreman for a fenced JSON action list. The foreman chooses whether to scout, create tasks, dispatch a worker, request a review, approve, rework, fail, cancel, take a note, update its brief, or mark the goal done.
-4. Apply state changes, including merging an approved task branch into the goal branch. A conflict becomes rework.
-5. Run the scouts, workers, and reviewers the foreman asked for. At most `max_parallel_workers` of them run at once, and extra dispatches wait for the next turn.
+3. Ask the foreman for one fenced JSON action list.
+4. Apply state changes in that order. Approving a task merges its branch into the goal branch. A conflict becomes rework.
+5. Run the scouts, workers, and reviewers from that list, together. At most `max_parallel_workers` run at once. Extra dispatches wait for the next turn.
 
-When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. The run stops at `max_foreman_turns` (default 25), after two foreman failures in a row, or when a turn runs no agents and changes nothing.
+| Action | What Kiln does |
+| --- | --- |
+| `create_task` | Add a task. `ref` names it for later actions in the same list. `depends_on` takes refs or task ids. `priority` is an integer; higher values are scheduled first. |
+| `scout` | Explore the repo and answer `question`. The note is in the next turn's state. |
+| `dispatch` | Run a worker on a ready pending task, by `task_id` or `ref`. |
+| `review` | Run the reviewer on a task in review. `focus` is optional. |
+| `approve` | Merge a task in review into the goal branch. |
+| `rework` | Send a task in review back to pending with `feedback`. |
+| `fail` | Fail a task. `reason` is optional. |
+| `cancel` | Cancel a task. |
+| `note` | Save `text` for later turns. |
+| `update_brief` | Replace the goal brief. |
+| `goal_done` | Finish the goal. `evidence` is a non-empty list, and every task must already be finished. |
 
-Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The foreman and scouts use `--mode ask` and do not edit the tree.
+When a goal has no pending, claimed, running, or review tasks, Kiln pushes its branch and opens the pull request. The body includes the brief, the evidence, and the tasks. The run stops at `max_foreman_turns` (default 25), after two foreman failures in a row, or when a turn runs no agents and changes nothing.
+
+Each worker claims one task, checks out `kiln/<id>-<slug>` under `.kiln/worktrees/<id>/` from the goal branch, runs `agent` with `--force --trust`, commits, and optionally runs the `verify` command. The task then waits in review. The reviewer uses `--mode ask` in that worktree and sees the diff against the goal branch. The foreman and scouts use `--mode ask`.
 
 A task that has used `max_attempts` fails instead of starting another attempt.
 
@@ -107,8 +121,9 @@ A task that has used `max_attempts` fails instead of starting another attempt.
 | `max_foreman_turns` | How many foreman turns one run may take. Default 25. |
 | `max_attempts` | Rework attempts before a task fails. Default 3. |
 | `delete_merged_branches` | Delete a task branch after it merges into the goal branch. Default true. The goal branch stays. |
-| `models.foreman` | Frontier model for planning and review. |
+| `models.foreman` | Model that decides what happens each turn. |
 | `models.worker` | Model that edits code. |
-| `models.scout` | Cheaper model for exploration. |
+| `models.scout` | Model for exploration. |
+| `models.reviewer` | Model that reads the diff and returns a verdict. |
 
-The defaults are `claude-opus-5-thinking-high`, `claude-sonnet-5-thinking-high`, and `composer-2.5`. `KILN_AGENT_BIN` overrides the `agent` executable.
+The defaults are `claude-opus-5-thinking-high` for the foreman, `claude-sonnet-5-thinking-high` for the worker and the reviewer, and `composer-2.5` for the scout. `KILN_AGENT_BIN` overrides the `agent` executable.
