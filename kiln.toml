@@ -1,0 +1,25 @@
+# Kiln factory settings for this repository.
+
+# Branch the pull request targets.
+base_branch = "feat/foreman-driven-loop"
+
+# Command run in the worktree after a worker finishes. Empty skips verification.
+verify = ""
+
+# How many scouts, workers, and reviewers one turn may run at once.
+max_parallel_workers = 2
+
+# Rework attempts before a task is failed.
+max_attempts = 3
+
+# Foreman turns one `kiln run` may take before it stops.
+max_foreman_turns = 25
+
+# Delete a task branch after it merges into the goal branch.
+delete_merged_branches = true
+
+[models]
+foreman = "claude-opus-5-thinking-high"
+worker = "claude-sonnet-5-thinking-high"
+scout = "composer-2.5"
+reviewer = "claude-sonnet-5-thinking-high"
