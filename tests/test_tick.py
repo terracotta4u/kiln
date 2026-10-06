@@ -440,6 +440,63 @@ def test_scout_then_worker_then_reviewer_before_approve(factory: Path):
     assert any(f"reviewed #{worker.id}: approve" in line for line in reviewed)
 
 
+def test_a_dispatch_does_not_see_another_dispatch_finish(factory: Path):
+    script = _agent(factory, _graph_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it", "Add a marker")
+        messages = apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "first",
+                    "role": "worker",
+                    "title": "Add marker",
+                    "acceptance": "file exists",
+                },
+                {
+                    "type": "create_job",
+                    "ref": "second",
+                    "role": "worker",
+                    "title": "Next",
+                    "depends_on": ["first"],
+                },
+                {
+                    "type": "create_job",
+                    "ref": "check",
+                    "role": "reviewer",
+                    "title": "Review marker",
+                    "target_job_id": "first",
+                    "depends_on": ["first"],
+                },
+                {"type": "dispatch", "ref": "first"},
+                {"type": "dispatch", "ref": "second"},
+                {"type": "dispatch", "ref": "check"},
+            ],
+            agent_bin=str(script),
+        )
+        jobs = {job.role: job for job in list_jobs(conn) if job.role != JobRole.worker}
+        workers = [job for job in list_jobs(conn) if job.role == JobRole.worker]
+    finally:
+        conn.close()
+
+    first, second = workers
+    assert "completed" in messages[3]
+    assert f"job #{second.id} is blocked" in messages[4]
+    assert f"job #{jobs[JobRole.reviewer].id} is blocked" in messages[5]
+    assert first.status == JobStatus.completed
+    assert first.integration == Integration.pending
+    assert first.attempts == 1
+    assert second.status == JobStatus.pending
+    assert second.attempts == 0
+    assert jobs[JobRole.reviewer].status == JobStatus.pending
+    assert jobs[JobRole.reviewer].attempts == 0
+
+
 def test_a_single_worker_can_finish_the_goal(factory: Path):
     script = _agent(factory, _graph_agent())
     config = load_config(factory)

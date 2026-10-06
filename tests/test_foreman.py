@@ -123,7 +123,8 @@ def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
         depends_on=[first.id],
     )
     review = apply_actions(conn, _config(), goal, [{"type": "dispatch", "job_id": reviewer.id}])
-    assert limited == ["limit reached, dispatch next turn", "limit reached, dispatch next turn"]
+    assert limited[0] == "limit reached, dispatch next turn"
+    assert "blocked" in limited[1]
     assert "blocked" in blocked[0]
     assert "pending integration" in review[0]
     stored = {job.id: job for job in list_jobs(conn, goal_id=goal.id)}

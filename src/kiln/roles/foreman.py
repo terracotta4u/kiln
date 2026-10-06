@@ -199,7 +199,8 @@ def apply_actions(
 ) -> AppliedActions:
     """Apply foreman decisions. One bad action does not discard the rest.
 
-    State changes run first. Dispatches then run together, and only when an action asks for them.
+    State changes run first. Dispatches that are already ready then run together.
+    A dispatch cannot become ready because another dispatch in this list finishes.
     """
     refs: dict[str, int] = {}
     for task in list_jobs(conn, goal_id=goal.id):
@@ -424,18 +425,35 @@ def _run_agents(
     agent_bin: str | None,
     reporter: Callable[[str], None] | None,
 ) -> int:
+    """Launch only dispatches that are ready before any agent starts.
+
+    The ready set is the state after create, approve, reject, rework, and the other
+    state actions. Completing a job in this turn does not make a later dispatch eligible.
+    """
     pending: list[tuple[int, dict]] = []
     dispatched = 0
     holder = connect(db_path)
     try:
         migrate(holder)
+        ready_ids = {job.id for job in ready_jobs(holder, goal_id=goal.id)}
         for index, action in actions:
             if action.get("type") != "dispatch":
                 pending.append((index, action))
                 continue
+            try:
+                job_id = _resolve_job_ref(holder, goal, action, refs)
+            except KilnError as exc:
+                messages[index] = _record_action(holder, f"action {index} failed: {exc}")
+                continue
+            if job_id not in ready_ids:
+                messages[index] = _record_action(
+                    holder, f"action {index} failed: job #{job_id} is blocked"
+                )
+                continue
             if dispatched >= limit:
                 messages[index] = _record_action(holder, "limit reached, dispatch next turn")
                 continue
+            ready_ids.discard(job_id)
             dispatched += 1
             pending.append((index, action))
     finally:
@@ -628,8 +646,6 @@ def _dispatch(
     job = require_job(conn, job_id)
     if job.status != JobStatus.pending:
         raise KilnError(f"job #{job_id} is {job.status.value}; only a pending job can be dispatched")
-    if job.id not in {ready.id for ready in ready_jobs(conn, goal_id=goal.id)}:
-        raise KilnError(f"job #{job_id} is blocked")
     if job.role == JobRole.worker:
         outcome = run_worker(conn, config, task_id=job_id, agent_bin=agent_bin, reporter=reporter)
         branch = outcome.job.branch or ""
