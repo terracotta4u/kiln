@@ -270,6 +270,7 @@ def test_turn_cap_stops_after_notes(factory: Path):
 
     assert len(notes) == 2
     assert status == GoalStatus.active
+    assert result.stop_reason == "turn_limit"
     assert "stopped: reached 2 foreman turns" in result.lines
 
 
@@ -285,6 +286,7 @@ def test_two_foreman_failures_stop_the_run(factory: Path):
 
     failures = [line for line in result.lines if line.startswith("foreman failed")]
     assert len(failures) == 2
+    assert result.stop_reason == "foreman_failures"
     assert "stopped: foreman failed twice in a row" in result.lines
     assert not any("reached" in line for line in result.lines)
 
@@ -307,8 +309,34 @@ def test_no_progress_stops_the_run(factory: Path):
         conn.close()
 
     assert status == GoalStatus.active
+    assert result.stop_reason == "no_progress"
     assert any("no actions" in line for line in result.lines)
     assert "stopped: a turn made no progress" in result.lines
+
+
+def test_should_stop_ends_the_run_before_the_next_turn(factory: Path):
+    script = _agent(factory, _note_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    seen = {"n": 0}
+
+    def stop() -> bool:
+        seen["n"] += 1
+        return seen["n"] > 1
+
+    try:
+        goal = add_goal(conn, "Ship it")
+        result = run_until_done(conn, config, agent_bin=str(script), turns=5, should_stop=stop)
+        notes = list_notes(conn, goal.id)
+        status = get_goal_row(conn)
+    finally:
+        conn.close()
+
+    assert seen["n"] == 2
+    assert len(notes) == 1
+    assert status == GoalStatus.active
+    assert result.stop_reason == "server_shutdown"
+    assert "stopped: server shutting down" in result.lines
 
 
 def test_cli_run_turns_dry_run_and_drops_no_dispatch(factory: Path, monkeypatch: pytest.MonkeyPatch):

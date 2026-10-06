@@ -22,6 +22,8 @@ from kiln.errors import KilnError
 
 DEFAULT_TIMEOUT_SECONDS = 600
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_LIVE: set[subprocess.Popen[str]] = set()
+_LIVE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,14 @@ class AgentResult:
 
 def default_agent_bin() -> str:
     return os.environ.get("KILN_AGENT_BIN", "agent")
+
+
+def kill_live_agents() -> None:
+    """Kill every agent process this interpreter still has running."""
+    with _LIVE_LOCK:
+        processes = list(_LIVE)
+    for process in processes:
+        _kill(process)
 
 
 def build_command(
@@ -128,7 +138,13 @@ def run_agent(
     except FileNotFoundError as exc:
         raise KilnError(f"agent executable not found: {command[0]}") from exc
 
-    stdout = _capture(process, command, prompt, log_path, timeout)
+    with _LIVE_LOCK:
+        _LIVE.add(process)
+    try:
+        stdout = _capture(process, command, prompt, log_path, timeout)
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.discard(process)
     timed_out = stdout is None
     if timed_out:
         captured = _read_log_output(log_path)

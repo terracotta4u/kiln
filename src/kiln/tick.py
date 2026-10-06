@@ -17,6 +17,9 @@ class TickResult:
     lines: list[str] = field(default_factory=list)
     foreman_failed: bool = False
     agents_ran: int = 0
+    # None means the loop ended because no active goals remain.
+    # Otherwise: turn_limit, no_progress, foreman_failures, server_shutdown.
+    stop_reason: str | None = None
 
 
 def run_turn(
@@ -134,8 +137,14 @@ def run_until_done(
     agent_bin: str | None = None,
     gh_bin: str = "gh",
     reporter: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> TickResult:
-    """Turn until every active goal is finished, then open a pull request for each."""
+    """Turn until every active goal is finished, then open a pull request for each.
+
+    stop_reason stays None when no active goals remain. A loop that ends with work
+    still open sets turn_limit, no_progress, or foreman_failures. should_stop ends
+    the loop at the next turn with server_shutdown.
+    """
     cap = config.max_foreman_turns if turns is None else turns
     if cap < 1:
         raise KilnError("turns must be >= 1")
@@ -149,13 +158,19 @@ def run_until_done(
                 _record(result, ["no active goals"], reporter)
             break
         if used >= cap:
+            result.stop_reason = "turn_limit"
             _record(result, [f"stopped: reached {cap} foreman turns"], reporter)
             break
         before = _snapshot(conn)
         agents = 0
         failed = False
         for goal in goals:
+            if should_stop is not None and should_stop():
+                result.stop_reason = "server_shutdown"
+                _record(result, ["stopped: server shutting down"], reporter)
+                return result
             if used >= cap:
+                result.stop_reason = "turn_limit"
                 _record(result, [f"stopped: reached {cap} foreman turns"], reporter)
                 return result
             turn = run_turn(
@@ -178,11 +193,13 @@ def run_until_done(
                 streak = 0
             _record(result, publish_ready_goals(conn, config, gh_bin=gh_bin), reporter)
             if streak >= 2:
+                result.stop_reason = "foreman_failures"
                 _record(result, ["stopped: foreman failed twice in a row"], reporter)
                 return result
             if not list_goals(conn, status=GoalStatus.active):
                 return result
         if agents == 0 and not failed and _snapshot(conn) == before:
+            result.stop_reason = "no_progress"
             _record(result, [_stuck_message(conn)], reporter)
             break
     return result
