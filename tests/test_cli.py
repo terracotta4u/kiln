@@ -53,7 +53,7 @@ def test_init_outside_a_git_repo_fails(tmp_path, monkeypatch):
     assert "git repository" in result.output
 
 
-def test_goal_and_task_flow(repo):
+def test_goal_and_job_flow(repo):
     assert runner.invoke(app, ["init"]).exit_code == 0
     toml = (repo / "kiln.toml").read_text().replace("max_attempts = 3", "max_attempts = 7")
     (repo / "kiln.toml").write_text(toml)
@@ -71,23 +71,23 @@ def test_goal_and_task_flow(repo):
     assert "\nbrief\n(none)" in shown_goal.output
     assert "\nevidence\n(none)" in shown_goal.output
 
-    first = runner.invoke(app, ["task", "add", "1", "Schema", "--priority", "1"])
+    first = runner.invoke(app, ["job", "add", "1", "Schema", "--priority", "1"])
     second = runner.invoke(
         app,
-        ["task", "add", "1", "CLI", "--depends-on", "1", "--acceptance", "commands work"],
+        ["job", "add", "1", "CLI", "--depends-on", "1", "--acceptance", "commands work"],
     )
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
 
-    cycle = runner.invoke(app, ["task", "dep", "1", "2"])
+    cycle = runner.invoke(app, ["job", "dep", "1", "2"])
     assert cycle.exit_code != 0
     assert "cycle" in cycle.output
 
-    pending = runner.invoke(app, ["task", "list", "--status", "pending"])
+    pending = runner.invoke(app, ["job", "list", "--status", "pending"])
     assert "Schema" in pending.output
     assert "deps: #1" in pending.output
 
-    shown = runner.invoke(app, ["task", "show", "2"])
+    shown = runner.invoke(app, ["job", "show", "2"])
     assert shown.exit_code == 0, shown.output
     assert "attempts    0/7" in shown.output
     assert "commands work" in shown.output
@@ -102,9 +102,22 @@ def test_goal_and_task_flow(repo):
     assert missing.exit_code != 0
     assert "no goal with id 9" in missing.output
 
-    cancelled = runner.invoke(app, ["task", "cancel", "2"])
+    cancelled = runner.invoke(app, ["job", "cancel", "2"])
     assert cancelled.exit_code == 0, cancelled.output
     assert "cancelled #2" in cancelled.output
+
+
+def test_job_add_with_a_bad_dependency_leaves_no_job(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Schema"]).exit_code == 0
+    failed = runner.invoke(app, ["job", "add", "1", "CLI", "--depends-on", "1", "--depends-on", "99"])
+    assert failed.exit_code != 0
+    assert "no job with id 99" in failed.output
+    listed = runner.invoke(app, ["job", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "Schema" in listed.output
+    assert "CLI" not in listed.output
 
 
 def test_commands_require_init(repo):
@@ -121,14 +134,14 @@ def test_log_and_runs_show(repo):
     assert "no events" in empty.output
 
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
-    assert runner.invoke(app, ["task", "add", "1", "Schema"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Schema"]).exit_code == 0
     logged = runner.invoke(app, ["log"])
     assert logged.exit_code == 0, logged.output
-    assert logged.output.index("goal.created") < logged.output.index("task.created")
-    assert "task #1" in logged.output
+    assert logged.output.index("goal.created") < logged.output.index("job.created")
+    assert "job #1" in logged.output
 
     latest = runner.invoke(app, ["log", "-n", "1"])
-    assert "task.created" in latest.output
+    assert "job.created" in latest.output
     assert "goal.created" not in latest.output
 
     rejected = runner.invoke(app, ["log", "-n", "0"])
@@ -161,7 +174,7 @@ def test_log_and_runs_show(repo):
     assert shown.exit_code == 0, shown.output
     assert "composer-2.5" in shown.output
     assert "readme exists" in shown.output
-    assert "task        (none)" in shown.output
+    assert "job         (none)" in shown.output
     assert "... 5 earlier lines" in shown.output
     assert "line 44" in shown.output
     assert "line 0\n" not in shown.output
@@ -175,7 +188,7 @@ def test_goal_show_prints_brief_and_evidence(repo):
     assert runner.invoke(app, ["init"]).exit_code == 0
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
     from kiln.db import connect
-    from kiln.tasks import set_goal_brief, set_goal_evidence
+    from kiln.jobs import set_goal_brief, set_goal_evidence
 
     config = load_config(repo)
     conn = connect(config.db_path)

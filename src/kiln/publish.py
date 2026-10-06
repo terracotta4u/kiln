@@ -14,10 +14,8 @@ from kiln.git import (
     push_branch,
     remote_url,
 )
-from kiln.models import Goal, GoalStatus, TaskStatus
-from kiln.tasks import list_tasks, require_goal, set_goal_branch, set_goal_pr, set_goal_status
-
-_OPEN = (TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review)
+from kiln.jobs import is_open, list_jobs, require_goal, set_goal_branch, set_goal_pr, set_goal_status
+from kiln.models import Goal, GoalStatus
 
 
 def ensure_goal_branch(conn: sqlite3.Connection, config: Config, goal: Goal) -> tuple[str, bool]:
@@ -40,7 +38,7 @@ def publish_ready_goals(
     gh_bin: str = "gh",
     remote: str = "origin",
 ) -> list[str]:
-    """Open one pull request for each goal whose tasks are all finished."""
+    """Open one pull request for each goal whose jobs are all finished."""
     lines: list[str] = []
     for goal in _goals_ready_to_publish(conn):
         lines.append(_publish_goal(conn, config, goal, gh_bin=gh_bin, remote=remote))
@@ -52,17 +50,17 @@ def _goals_ready_to_publish(conn: sqlite3.Connection) -> list[Goal]:
     for goal in list_goals_all(conn):
         if goal.pr_url is not None:
             continue
-        tasks = list_tasks(conn, goal_id=goal.id)
-        if any(task.status in _OPEN for task in tasks):
+        jobs = list_jobs(conn, goal_id=goal.id)
+        if any(is_open(job) for job in jobs):
             continue
-        if not tasks and goal.status != GoalStatus.done:
+        if not jobs and goal.status != GoalStatus.done:
             continue
         ready.append(goal)
     return ready
 
 
 def list_goals_all(conn: sqlite3.Connection):
-    from kiln.tasks import list_goals
+    from kiln.jobs import list_goals
 
     return list_goals(conn)
 
@@ -154,9 +152,9 @@ def _pull_request_body(conn: sqlite3.Connection, goal: Goal) -> str:
         lines.extend(f"- {item}" for item in goal.evidence)
     else:
         lines.append("(none)")
-    lines.extend(["", "Tasks:"])
-    for task in list_tasks(conn, goal_id=goal.id):
-        lines.append(f"- #{task.id} [{task.status.value}] {task.title}")
+    lines.extend(["", "Jobs:"])
+    for job in list_jobs(conn, goal_id=goal.id):
+        lines.append(f"- #{job.id} {job.role.value} [{job.status.value}] {job.title}")
     return "\n".join(lines).strip() + "\n"
 
 

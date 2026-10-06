@@ -11,14 +11,14 @@ def start_run(
     *,
     role: str,
     model: str,
-    task_id: int | None = None,
+    job_id: int | None = None,
 ) -> Run:
     cur = conn.execute(
         """
-        INSERT INTO runs (task_id, role, model, status, started_at)
+        INSERT INTO runs (job_id, role, model, status, started_at)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (task_id, role, model, RunStatus.running.value, utc_now()),
+        (job_id, role, model, RunStatus.running.value, utc_now()),
     )
     run_id = cur.lastrowid
     if run_id is None:
@@ -54,10 +54,10 @@ def finish_run(
     return require_run(conn, run_id)
 
 
-def latest_run(conn: sqlite3.Connection, task_id: int, role: str) -> Run | None:
+def latest_run(conn: sqlite3.Connection, job_id: int, role: str) -> Run | None:
     row = conn.execute(
-        "SELECT * FROM runs WHERE task_id = ? AND role = ? ORDER BY id DESC LIMIT 1",
-        (task_id, role),
+        "SELECT * FROM runs WHERE job_id = ? AND role = ? ORDER BY id DESC LIMIT 1",
+        (job_id, role),
     ).fetchone()
     return Run.from_row(row) if row else None
 

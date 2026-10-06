@@ -181,13 +181,13 @@ verify = ""
 # How many scouts, workers, and reviewers one turn may run at once.
 max_parallel_workers = {DEFAULT_MAX_PARALLEL_WORKERS}
 
-# Rework attempts before a task is failed.
+# Rework attempts before another attempt is refused.
 max_attempts = {DEFAULT_MAX_ATTEMPTS}
 
 # Foreman turns one `kiln run` may take before it stops.
 max_foreman_turns = {DEFAULT_MAX_FOREMAN_TURNS}
 
-# Delete a task branch after it merges into the goal branch.
+# Delete a job branch after it merges into the goal branch.
 delete_merged_branches = true
 
 [models]

@@ -10,11 +10,12 @@ from typer.testing import CliRunner
 from kiln.cli import app
 from kiln.config import init_factory, load_config
 from kiln.db import connect
-from kiln.models import GoalStatus, TaskStatus
+from kiln.jobs import add_goal, add_job, dependencies, get_job, list_jobs, require_goal
+from kiln.models import GoalStatus, Integration, JobRole, JobStatus
 from kiln.notes import list_notes
+from kiln.review import approve_job
+from kiln.roles.foreman import apply_actions
 from kiln.roles.worker import run_worker
-from kiln.review import approve_task
-from kiln.tasks import add_goal, add_task, get_task, list_tasks, require_goal
 from kiln.tick import run_tick, run_until_done
 
 runner = CliRunner()
@@ -40,23 +41,26 @@ def test_turns_dispatch_review_then_finish(factory: Path):
     try:
         add_goal(conn, "Ship it", "Add a marker file")
         first = run_tick(conn, config, agent_bin=str(script))
-        task = list_tasks(conn)[0]
+        job = list_jobs(conn)[0]
         on_main_after_work = (factory / "marker.txt").exists()
         second = run_tick(conn, config, agent_bin=str(script))
-        reviewed = get_task(conn, task.id)
+        reviewed = get_job(conn, job.id)
         third = run_tick(conn, config, agent_bin=str(script))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, job.id)
         goal = require_goal(conn, 1)
     finally:
         conn.close()
 
-    assert any("created task #1" in line for line in first.lines)
-    assert any("task #1  review" in line for line in first.lines)
-    assert task.status == TaskStatus.review
+    assert any("created job #1" in line for line in first.lines)
+    assert any("job #1  completed" in line for line in first.lines)
+    assert job.status == JobStatus.completed
+    assert job.integration == Integration.pending
     assert on_main_after_work is False
-    assert reviewed is not None and reviewed.status == TaskStatus.review
+    assert reviewed is not None and reviewed.status == JobStatus.completed
+    assert reviewed.integration == Integration.pending
     assert any("reviewed #1: approve" in line for line in second.lines)
-    assert stored is not None and stored.status == TaskStatus.done
+    assert stored is not None and stored.status == JobStatus.completed
+    assert stored.integration == Integration.merged
     assert not (factory / "marker.txt").exists()
     marker = subprocess.run(
         ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
@@ -79,7 +83,7 @@ def test_turns_dispatch_review_then_finish(factory: Path):
     assert goal.evidence == ("marker.txt is ok on the goal branch",)
 
 
-def test_conflict_sends_the_task_back_for_rework(factory: Path):
+def test_conflict_sends_the_job_back_for_rework(factory: Path):
     script = _agent(
         factory,
         "from pathlib import Path\n"
@@ -90,23 +94,21 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Edit readme")
-        run_worker(conn, config, task_id=task.id, agent_bin=str(script))
-        from kiln.tasks import require_goal
-
+        job = add_job(conn, goal.id, "Edit readme")
+        run_worker(conn, config, job_id=job.id, agent_bin=str(script))
         integration = require_goal(conn, goal.id).branch
         subprocess.run(["git", "checkout", integration], cwd=factory, check=True, capture_output=True)
         (factory / "README.md").write_text("goal\n")
         subprocess.run(["git", "commit", "-am", "goal edit"], cwd=factory, check=True, capture_output=True)
         subprocess.run(["git", "checkout", "main"], cwd=factory, check=True, capture_output=True)
-        message = approve_task(conn, config, task.id)
-        stored = get_task(conn, task.id)
+        message = approve_job(conn, config, job.id)
+        stored = get_job(conn, job.id)
     finally:
         conn.close()
 
     assert "rework" in message
     assert stored is not None
-    assert stored.status == TaskStatus.pending
+    assert stored.status == JobStatus.pending
     assert stored.feedback is not None and "conflicted" in stored.feedback
     assert (factory / "README.md").read_text() == "hello\n"
     goal_readme = subprocess.run(
@@ -129,17 +131,20 @@ def test_scout_action_runs_during_the_tick(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "Existing")
+        add_job(conn, goal.id, "Existing")
         first = run_tick(conn, config, agent_bin=str(script))
-        notes_after_first = list_notes(conn, goal.id)
+        scout_jobs = [job for job in list_jobs(conn, goal_id=goal.id) if job.role.value == "scout"]
         second = run_tick(conn, config, agent_bin=str(script))
         notes = list_notes(conn, goal.id)
     finally:
         conn.close()
 
-    assert any("scout note" in line for line in first.lines)
-    assert notes_after_first and "scout-me please" in notes_after_first[0].text
-    assert len(notes) == 1
+    assert any("scout job" in line for line in first.lines)
+    assert len(scout_jobs) == 1
+    assert scout_jobs[0].question == "scout-me please"
+    assert scout_jobs[0].status.value == "completed"
+    assert json.loads(scout_jobs[0].result or "")["summary"] == "answered"
+    assert notes == []
     assert any("no actions" in line for line in second.lines)
 
 
@@ -150,32 +155,32 @@ def test_dry_run_changes_nothing(factory: Path):
     try:
         add_goal(conn, "Ship it", "A factory")
         result = run_tick(conn, config, agent_bin=str(script), dry_run=True)
-        tasks = list_tasks(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
     assert not (factory / "agent-ran").exists()
-    assert tasks == []
+    assert jobs == []
     assert any("Ship it" in line for line in result.lines)
     assert any("Turn 1 of 25" in line for line in result.lines)
     assert any("would create branch" in line for line in result.lines)
 
 
-def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
+def test_worker_limit_dispatches_one_of_two_ready_jobs(factory: Path):
     script = _agent(factory, _smart_agent())
     config = load_config(factory)
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "First")
-        add_task(conn, goal.id, "Second")
+        add_job(conn, goal.id, "First")
+        add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=1, agent_bin=str(script))
-        tasks = list_tasks(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
-    statuses = sorted(task.status for task in tasks)
-    assert statuses == [TaskStatus.pending, TaskStatus.review]
+    statuses = sorted(job.status for job in jobs)
+    assert statuses == [JobStatus.completed, JobStatus.pending]
 
 
 def test_two_workers_run_together(factory: Path):
@@ -184,14 +189,14 @@ def test_two_workers_run_together(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "First")
-        add_task(conn, goal.id, "Second")
+        add_job(conn, goal.id, "First")
+        add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=2, agent_bin=str(script))
-        tasks = list_tasks(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
-    assert [task.status for task in tasks] == [TaskStatus.review, TaskStatus.review]
+    assert [job.status for job in jobs] == [JobStatus.completed, JobStatus.completed]
 
 
 def test_run_until_done_opens_one_pull_request(factory: Path):
@@ -215,7 +220,7 @@ def test_run_until_done_opens_one_pull_request(factory: Path):
         add_goal(conn, "Ship it", "Add a marker file")
         result = run_until_done(conn, config, agent_bin=str(script), gh_bin=str(gh))
         goal = get_goal_row(conn)
-        from kiln.tasks import list_goals
+        from kiln.jobs import list_goals
 
         stored = list_goals(conn)[0]
     finally:
@@ -340,7 +345,7 @@ def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setenv("KILN_AGENT_BIN", str(script))
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
-    assert runner.invoke(app, ["task", "add", "1", "Add marker"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Add marker"]).exit_code == 0
     worked = runner.invoke(app, ["work"])
     assert worked.exit_code == 0, worked.output
     approved = runner.invoke(app, ["review", "1", "--approve"])
@@ -357,6 +362,343 @@ def test_cli_review_approves(factory: Path, monkeypatch: pytest.MonkeyPatch):
     assert marker.stdout == "ok\n"
 
 
+def test_scout_then_worker_then_reviewer_before_approve(factory: Path):
+    script = _agent(factory, _graph_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it", "Add a marker")
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "look",
+                    "role": "scout",
+                    "title": "Where is the readme",
+                    "question": "Where is the readme?",
+                },
+                {"type": "dispatch", "ref": "look"},
+            ],
+            agent_bin=str(script),
+        )
+        scout = next(job for job in list_jobs(conn) if job.role == JobRole.scout)
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "marker",
+                    "role": "worker",
+                    "title": "Add marker",
+                    "acceptance": "file exists",
+                    "depends_on": [scout.id],
+                },
+                {"type": "dispatch", "ref": "marker"},
+            ],
+            agent_bin=str(script),
+        )
+        worker = next(job for job in list_jobs(conn) if job.role == JobRole.worker)
+        reviewed = apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "check",
+                    "role": "reviewer",
+                    "title": "Review marker",
+                    "target_job_id": worker.id,
+                    "depends_on": [scout.id, worker.id],
+                    "focus": "the marker",
+                },
+                {"type": "dispatch", "ref": "check"},
+            ],
+            agent_bin=str(script),
+        )
+        reviewer = next(job for job in list_jobs(conn) if job.role == JobRole.reviewer)
+        dep_ids = {dep.id for dep in dependencies(conn, reviewer.id)}
+        worker_after = get_job(conn, worker.id)
+        notes = list_notes(conn, goal.id)
+    finally:
+        conn.close()
+
+    assert scout.status == JobStatus.completed
+    assert json.loads(scout.result or "")["summary"] == "scouted"
+    assert notes == []
+    assert worker.status == JobStatus.completed
+    assert worker.integration == Integration.pending
+    assert dep_ids == {scout.id, worker.id}
+    assert reviewer.target_job_id == worker.id
+    assert reviewer.status == JobStatus.completed
+    assert worker_after is not None and worker_after.integration == Integration.pending
+    assert any(f"reviewed #{worker.id}: approve" in line for line in reviewed)
+
+
+def test_a_dispatch_does_not_see_another_dispatch_finish(factory: Path):
+    script = _agent(factory, _graph_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it", "Add a marker")
+        messages = apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "first",
+                    "role": "worker",
+                    "title": "Add marker",
+                    "acceptance": "file exists",
+                },
+                {
+                    "type": "create_job",
+                    "ref": "second",
+                    "role": "worker",
+                    "title": "Next",
+                    "depends_on": ["first"],
+                },
+                {
+                    "type": "create_job",
+                    "ref": "check",
+                    "role": "reviewer",
+                    "title": "Review marker",
+                    "target_job_id": "first",
+                    "depends_on": ["first"],
+                },
+                {"type": "dispatch", "ref": "first"},
+                {"type": "dispatch", "ref": "second"},
+                {"type": "dispatch", "ref": "check"},
+            ],
+            agent_bin=str(script),
+        )
+        jobs = {job.role: job for job in list_jobs(conn) if job.role != JobRole.worker}
+        workers = [job for job in list_jobs(conn) if job.role == JobRole.worker]
+    finally:
+        conn.close()
+
+    first, second = workers
+    assert "completed" in messages[3]
+    assert f"job #{second.id} is blocked" in messages[4]
+    assert f"job #{jobs[JobRole.reviewer].id} is blocked" in messages[5]
+    assert first.status == JobStatus.completed
+    assert first.integration == Integration.pending
+    assert first.attempts == 1
+    assert second.status == JobStatus.pending
+    assert second.attempts == 0
+    assert jobs[JobRole.reviewer].status == JobStatus.pending
+    assert jobs[JobRole.reviewer].attempts == 0
+
+
+def test_a_single_worker_can_finish_the_goal(factory: Path):
+    script = _agent(factory, _graph_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "marker",
+                    "role": "worker",
+                    "title": "Add marker",
+                    "acceptance": "file exists",
+                },
+                {"type": "dispatch", "ref": "marker"},
+            ],
+            agent_bin=str(script),
+        )
+        apply_actions(conn, config, goal, [{"type": "approve", "job_id": 1}])
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [{"type": "goal_done", "evidence": ["marker.txt exists on the goal branch"]}],
+        )
+        jobs = list_jobs(conn)
+        stored = require_goal(conn, goal.id)
+    finally:
+        conn.close()
+
+    assert len(jobs) == 1
+    assert jobs[0].role == JobRole.worker
+    assert jobs[0].status == JobStatus.completed
+    assert jobs[0].integration == Integration.merged
+    assert stored.status == GoalStatus.done
+
+
+def test_rework_keeps_the_first_attempt_and_the_next_review_sees_the_new_one(factory: Path):
+    script = _agent(factory, _lifecycle_agent())
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it", "Add a marker")
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "marker",
+                    "role": "worker",
+                    "title": "Add marker",
+                    "acceptance": "file exists",
+                },
+                {"type": "dispatch", "ref": "marker"},
+            ],
+            agent_bin=str(script),
+        )
+        worker = get_job(conn, 1)
+        assert worker is not None
+        first_roles = _run_roles(conn, worker.id)
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "first",
+                    "role": "reviewer",
+                    "title": "First review",
+                    "target_job_id": worker.id,
+                    "depends_on": [worker.id],
+                    "focus": "the first draft",
+                },
+                {"type": "dispatch", "ref": "first"},
+            ],
+            agent_bin=str(script),
+        )
+        after_review = get_job(conn, worker.id)
+        first_review = next(job for job in list_jobs(conn) if job.role == JobRole.reviewer)
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [{"type": "rework", "job_id": worker.id, "feedback": "try again"}],
+        )
+        reworked = get_job(conn, worker.id)
+        roles_after_rework = _run_roles(conn, worker.id)
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [{"type": "dispatch", "job_id": worker.id}],
+            agent_bin=str(script),
+        )
+        second = get_job(conn, worker.id)
+        roles_after_second = _run_roles(conn, worker.id)
+        apply_actions(
+            conn,
+            config,
+            goal,
+            [
+                {
+                    "type": "create_job",
+                    "ref": "second",
+                    "role": "reviewer",
+                    "title": "Second review",
+                    "target_job_id": worker.id,
+                    "depends_on": [worker.id],
+                    "focus": "the second draft",
+                },
+                {"type": "dispatch", "ref": "second"},
+            ],
+            agent_bin=str(script),
+        )
+        reviews = [job for job in list_jobs(conn) if job.role == JobRole.reviewer]
+        apply_actions(conn, config, goal, [{"type": "approve", "job_id": worker.id}])
+        approved = get_job(conn, worker.id)
+        reviews_after = [job for job in list_jobs(conn) if job.role == JobRole.reviewer]
+    finally:
+        conn.close()
+
+    assert worker.status == JobStatus.completed
+    assert worker.integration == Integration.pending
+    assert worker.result is not None and "wrote one" in worker.result
+    assert first_roles == ["worker"]
+    assert after_review is not None and after_review.status == JobStatus.completed
+    assert after_review.integration == Integration.pending
+    assert after_review.result is not None and "wrote one" in after_review.result
+    assert first_review.status == JobStatus.completed
+    assert first_review.result is not None and "first attempt" in first_review.result
+    assert reworked is not None
+    assert reworked.status == JobStatus.pending
+    assert reworked.result is None
+    assert reworked.integration is None
+    assert reworked.feedback == "try again"
+    assert reworked.branch
+    assert roles_after_rework == ["worker"]
+    assert second is not None and second.status == JobStatus.completed
+    assert second.integration == Integration.pending
+    assert second.result is not None and "wrote two" in second.result
+    assert roles_after_second == ["worker", "worker"]
+    assert len(reviews) == 2
+    assert reviews[0].id == first_review.id
+    assert reviews[0].status == JobStatus.completed
+    assert reviews[1].status == JobStatus.completed
+    assert reviews[1].result is not None and "second attempt" in reviews[1].result
+    assert approved is not None and approved.status == JobStatus.completed
+    assert approved.integration == Integration.merged
+    assert approved.result is not None and "wrote two" in approved.result
+    assert reviews_after[0].result == first_review.result
+
+
+def _run_roles(conn, job_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT role FROM runs WHERE job_id = ? ORDER BY id",
+        (job_id,),
+    ).fetchall()
+    return [row["role"] for row in rows]
+
+
+def _graph_agent() -> str:
+    return f"""
+import sys
+from pathlib import Path
+prompt = sys.argv[-1]
+if "You are a scout" in prompt:
+    {_emit_call('{"summary": "scouted", "findings": ["README.md"]}')}
+elif "You are a Kiln reviewer" in prompt:
+    {_emit_call('{"verdict": "approve", "summary": "looked", "findings": ["marker"], "confidence": 0.8}')}
+else:
+    Path("marker.txt").write_text("ok\\n")
+    {_emit_call('{"summary": "added marker", "files": ["marker.txt"]}')}
+"""
+
+
+def _lifecycle_agent() -> str:
+    return f"""
+import sys
+from pathlib import Path
+prompt = sys.argv[-1]
+if "You are a Kiln reviewer" in prompt:
+    if "+two" in prompt:
+        {_emit_call('{"verdict": "approve", "summary": "second attempt", "findings": [], "confidence": 0.9}')}
+    else:
+        {_emit_call('{"verdict": "needs_changes", "summary": "first attempt", "findings": ["rewrite it"], "confidence": 0.4}')}
+else:
+    if "try again" in prompt:
+        Path("marker.txt").write_text("two\\n")
+        {_emit_call('{"summary": "wrote two", "files": ["marker.txt"]}')}
+    else:
+        Path("marker.txt").write_text("one\\n")
+        {_emit_call('{"summary": "wrote one", "files": ["marker.txt"]}')}
+"""
+
+
 def _smart_agent() -> str:
     return f"""
 import json, sys
@@ -367,14 +709,14 @@ if "You are a scout" in prompt:
 elif "You are a Kiln reviewer" in prompt:
     {_emit_call('{"verdict": "approve", "summary": "marker is one line", "findings": ["file exists"], "confidence": 0.9}')}
 elif "You are the Kiln foreman" in prompt:
-    if "[review]" in prompt and "marker is one line" in prompt:
-        {_emit_call('{"actions": [{"type": "approve", "task_id": 1}, {"type": "update_brief", "text": "Success: marker.txt exists."}, {"type": "goal_done", "evidence": ["marker.txt is ok on the goal branch"]}]}')}
-    elif "[review]" in prompt:
-        {_emit_call('{"actions": [{"type": "review", "task_id": 1, "focus": "marker.txt is one line"}]}')}
-    elif "Tasks:\\n(none)" in prompt:
-        {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}, {"type": "dispatch", "ref": "marker"}]}')}
+    if "[completed]" in prompt and "integration pending" in prompt and "marker is one line" in prompt:
+        {_emit_call('{"actions": [{"type": "approve", "job_id": 1}, {"type": "update_brief", "text": "Success: marker.txt exists."}, {"type": "goal_done", "evidence": ["marker.txt is ok on the goal branch"]}]}')}
+    elif "[completed]" in prompt and "integration pending" in prompt:
+        {_emit_call('{"actions": [{"type": "create_job", "ref": "check", "role": "reviewer", "title": "Review marker", "target_job_id": 1, "depends_on": [1], "focus": "marker.txt is one line"}, {"type": "dispatch", "ref": "check"}]}')}
+    elif "Jobs:\\n(none)" in prompt:
+        {_emit_call('{"actions": [{"type": "create_job", "ref": "marker", "role": "worker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}, {"type": "dispatch", "ref": "marker"}]}')}
     elif "[pending]" in prompt:
-        {_emit_call('{"actions": [{"type": "dispatch", "task_id": 1}, {"type": "dispatch", "task_id": 2}]}')}
+        {_emit_call('{"actions": [{"type": "dispatch", "job_id": 1}, {"type": "dispatch", "job_id": 2}]}')}
     else:
         {_emit_call('{"actions": []}')}
 else:
@@ -402,7 +744,7 @@ elif "You are the Kiln foreman" in prompt:
     if "scout-me please" in prompt:
         {_emit_call('{"actions": []}')}
     else:
-        {_emit_call('{"actions": [{"type": "scout", "question": "scout-me please"}]}')}
+        {_emit_call('{"actions": [{"type": "create_job", "ref": "look", "role": "scout", "title": "scout-me please", "question": "scout-me please"}, {"type": "dispatch", "ref": "look"}]}')}
 else:
     {_emit_call('{"summary": "worker", "files": []}')}
 """
@@ -437,6 +779,6 @@ def _agent(directory: Path, body: str) -> Path:
 
 
 def get_goal_row(conn):
-    from kiln.tasks import list_goals
+    from kiln.jobs import list_goals
 
     return list_goals(conn)[0].status

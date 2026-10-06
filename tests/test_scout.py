@@ -11,11 +11,11 @@ from kiln.cli import app
 from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
-from kiln.models import RunStatus
+from kiln.jobs import add_goal
+from kiln.models import JobStatus, RunStatus
 from kiln.notes import list_notes
 from kiln.roles.scout import run_scout
 from kiln.runs import get_run
-from kiln.tasks import add_goal
 
 runner = CliRunner()
 
@@ -28,7 +28,7 @@ def factory(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_scout_stores_the_report_as_a_note(factory, monkeypatch):
+def test_scout_stores_the_report_on_the_job(factory, monkeypatch):
     capture = factory / "args"
     monkeypatch.setenv("KILN_CAPTURE_ARGS", str(capture))
     script = _agent(
@@ -48,13 +48,20 @@ def test_scout_stores_the_report_as_a_note(factory, monkeypatch):
             goal_id=goal.id,
             agent_bin=str(script),
         )
+        notes = list_notes(conn, goal.id)
     finally:
         conn.close()
 
     assert outcome.failure is None
-    assert outcome.note is not None
-    assert "found it" in outcome.note.text
-    assert "pyproject.toml" in outcome.note.text
+    assert outcome.summary == "found it"
+    assert outcome.job.status == JobStatus.completed
+    assert outcome.job.integration is None
+    stored = json.loads(outcome.job.result or "")
+    assert stored["summary"] == "found it"
+    assert stored["evidence"] == ["pyproject.toml"]
+    assert stored["artifacts"] == []
+    assert stored["role_result"] == {"summary": "found it", "findings": ["pyproject.toml"]}
+    assert notes == []
     assert outcome.run.status == RunStatus.succeeded
     assert json.loads(outcome.run.report_json or "")["summary"] == "found it"
     args = capture.read_text()
@@ -73,7 +80,9 @@ def test_scout_uses_the_only_active_goal(factory):
         add_goal(conn, "Only")
         outcome = run_scout(conn, config, "What is here?", agent_bin=str(script))
         assert outcome.goal.title == "Only"
-        assert list_notes(conn, outcome.goal.id)
+        assert outcome.job.status == JobStatus.completed
+        assert json.loads(outcome.job.result or "")["summary"] == "only goal"
+        assert list_notes(conn, outcome.goal.id) == []
     finally:
         conn.close()
 
@@ -90,8 +99,9 @@ def test_failed_scout_does_not_store_a_note(factory):
     try:
         goal = add_goal(conn, "Ship it")
         outcome = run_scout(conn, config, "Look", goal_id=goal.id, agent_bin=str(script))
-        assert outcome.note is None
         assert outcome.failure == "response had no JSON report"
+        assert outcome.job.status == JobStatus.failed
+        assert outcome.job.result is None
         assert outcome.run.status == RunStatus.failed
         assert list_notes(conn, goal.id) == []
         stored = get_run(conn, outcome.run.id)
@@ -121,7 +131,8 @@ def test_cli_scout(factory, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "scouting goal #1" in result.output
     assert "cli report" in result.output
-    assert "note #1" in result.output
+    assert "completed" in result.output
+    assert "note #" not in result.output
 
 
 def _print_report(summary: str, findings: list[str]) -> str:

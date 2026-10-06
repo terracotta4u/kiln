@@ -16,8 +16,8 @@ class MergeResult:
     message: str
 
 
-def branch_name(task_id: int, title: str) -> str:
-    return f"kiln/{task_id}-{_slug(title, 'task')}"
+def branch_name(job_id: int, title: str) -> str:
+    return f"kiln/{job_id}-{_slug(title, 'job')}"
 
 
 def goal_branch_name(goal_id: int, title: str) -> str:
@@ -92,6 +92,11 @@ def branch_diff(repo: Path, base: str, branch: str) -> str:
     """Full diff of commits on branch that are not in base."""
     result = _git(repo, "diff", f"{base}...{branch}")
     return result.stdout
+
+
+def revision(repo: Path) -> str:
+    """Current commit of a checkout."""
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
 def commit_if_dirty(worktree: Path, message: str) -> bool:

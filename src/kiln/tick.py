@@ -6,10 +6,10 @@ from kiln.config import Config
 from kiln.errors import KilnError
 from kiln.gc import cleanup
 from kiln.git import branch_exists, goal_branch_name
-from kiln.models import Goal, GoalStatus, TaskStatus
+from kiln.jobs import is_open, list_goals, list_jobs, require_goal
+from kiln.models import Goal, GoalStatus
 from kiln.publish import ensure_goal_branch, publish_ready_goals
 from kiln.roles.foreman import apply_actions, goal_brief, run_foreman
-from kiln.tasks import list_goals, list_tasks, require_goal
 
 
 @dataclass
@@ -201,20 +201,19 @@ def _snapshot(conn: sqlite3.Connection) -> tuple:
         (goal.id, goal.status.value, goal.branch, goal.pr_url, goal.brief, goal.evidence)
         for goal in list_goals(conn)
     )
-    tasks = tuple((task.id, task.status.value, task.attempts) for task in list_tasks(conn))
+    jobs = tuple(
+        (job.id, job.status.value, job.integration.value if job.integration else "", job.attempts)
+        for job in list_jobs(conn)
+    )
     notes = conn.execute("SELECT COUNT(*) AS n FROM notes").fetchone()["n"]
-    return (goals, tasks, notes)
+    return (goals, jobs, notes)
 
 
 def _stuck_message(conn: sqlite3.Connection) -> str:
-    open_tasks = [
-        task
-        for task in list_tasks(conn)
-        if task.status in (TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review)
-    ]
-    if not open_tasks:
+    open_jobs = [job for job in list_jobs(conn) if is_open(job)]
+    if not open_jobs:
         return "stopped: a turn made no progress"
-    detail = ", ".join(f"#{task.id} {task.status.value}" for task in open_tasks)
+    detail = ", ".join(f"#{job.id} {job.status.value}" for job in open_jobs)
     return f"stopped: a turn made no progress ({detail})"
 
 

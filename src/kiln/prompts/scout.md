@@ -14,4 +14,4 @@ Investigate only as far as the question requires. End your reply with a single f
 {"summary": "short answer the foreman can store", "findings": ["specific observation"]}
 ```
 
-The summary becomes a note. Keep it factual.
+The summary is stored on the scout job. Keep it factual.

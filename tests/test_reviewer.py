@@ -10,12 +10,12 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
 from kiln.git import commit_if_dirty, remove_worktree
-from kiln.models import RunStatus, TaskStatus
+from kiln.models import Integration, JobRole, JobStatus, RunStatus
 from kiln.roles.foreman import goal_brief
 from kiln.roles.reviewer import DIFF_CHAR_LIMIT, run_reviewer
 from kiln.roles.worker import run_worker
 from kiln.runs import finish_run, start_run
-from kiln.tasks import add_goal, add_task, get_task, require_goal
+from kiln.jobs import add_goal, add_job, get_job, require_goal
 
 
 @pytest.fixture
@@ -31,25 +31,25 @@ def factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
+def test_reviewer_sees_the_diff_and_leaves_the_worker_pending(factory: Path):
     worker = _agent(factory, "worker-agent", _worker_script())
     reviewer = _agent(factory, "reviewer-agent", _reviewer_script())
     config = load_config(factory)
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it", "Add a marker")
-        task = add_task(conn, goal.id, "Add marker", acceptance="marker.txt exists")
-        run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
-        reviewed = get_task(conn, task.id)
+        job = add_job(conn, goal.id, "Add marker", acceptance="marker.txt exists")
+        run_worker(conn, config, job_id=job.id, agent_bin=str(worker))
+        reviewed = get_job(conn, job.id)
         assert reviewed is not None and reviewed.worktree_path
         remove_worktree(factory, Path(reviewed.worktree_path))
 
-        outcome = run_reviewer(conn, config, task.id, focus="check the marker", agent_bin=str(reviewer))
-        stored = get_task(conn, task.id)
+        outcome = run_reviewer(conn, config, job.id, focus="check the marker", agent_bin=str(reviewer))
+        stored = get_job(conn, job.id)
         brief = goal_brief(conn, config, require_goal(conn, goal.id))
         log = Path(outcome.run.log_path or "").read_text()
 
-        later = start_run(conn, role="worker", model="worker", task_id=task.id)
+        later = start_run(conn, role="worker", model="worker", job_id=job.id)
         finish_run(
             conn,
             later.id,
@@ -64,8 +64,16 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
 
     assert outcome.failure is None
     assert outcome.verdict == "needs_changes"
+    assert outcome.job.role == JobRole.reviewer
+    assert outcome.job.target_job_id == job.id
+    assert outcome.job.status == JobStatus.completed
+    review = json.loads(outcome.job.result or "")
+    assert review["role_result"]["verdict"] == "needs_changes"
     assert stored is not None
-    assert stored.status == TaskStatus.review
+    assert stored.status == JobStatus.completed
+    assert stored.integration == Integration.pending
+    worker_result = json.loads(stored.result or "")
+    assert worker_result["summary"] == "added marker"
     assert (Path(stored.worktree_path or "") / "reviewer-was-here").is_file()
     assert not (factory / "reviewer-was-here").exists()
     command, _prompt = log.split("--- prompt ---", 1)
@@ -76,7 +84,9 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
     assert "check the marker" in log
     assert "needs_changes" in brief
     assert "marker is one line" in brief
-    assert "needs_changes" not in hidden
+    assert "diffstat" not in brief
+    assert "needs_changes" in hidden
+    assert "added marker" in hidden
 
 
 def test_reviewer_truncates_a_long_diff(factory: Path):
@@ -86,14 +96,14 @@ def test_reviewer_truncates_a_long_diff(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
-        run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
-        stored = get_task(conn, task.id)
+        job = add_job(conn, goal.id, "Add marker")
+        run_worker(conn, config, job_id=job.id, agent_bin=str(worker))
+        stored = get_job(conn, job.id)
         assert stored is not None and stored.worktree_path
         worktree = Path(stored.worktree_path)
         (worktree / "big.txt").write_text("x" * (DIFF_CHAR_LIMIT + 5000))
         commit_if_dirty(worktree, "add a large file")
-        outcome = run_reviewer(conn, config, task.id, agent_bin=str(reviewer))
+        outcome = run_reviewer(conn, config, job.id, agent_bin=str(reviewer))
         log = Path(outcome.run.log_path or "").read_text()
     finally:
         conn.close()
@@ -102,14 +112,14 @@ def test_reviewer_truncates_a_long_diff(factory: Path):
     assert "[diff truncated," in log
 
 
-def test_reviewer_rejects_a_task_that_is_not_in_review(factory: Path):
+def test_reviewer_rejects_a_job_that_is_not_waiting(factory: Path):
     config = load_config(factory)
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
-        with pytest.raises(KilnError, match="only a task in review"):
-            run_reviewer(conn, config, task.id, agent_bin=str(factory / "missing"))
+        job = add_job(conn, goal.id, "Add marker")
+        with pytest.raises(KilnError, match="pending integration"):
+            run_reviewer(conn, config, job.id, agent_bin=str(factory / "missing"))
     finally:
         conn.close()
 
@@ -121,16 +131,21 @@ def test_reviewer_records_a_bad_report_as_a_failure(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
-        run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
-        outcome = run_reviewer(conn, config, task.id, agent_bin=str(reviewer))
-        stored = get_task(conn, task.id)
+        job = add_job(conn, goal.id, "Add marker")
+        run_worker(conn, config, job_id=job.id, agent_bin=str(worker))
+        outcome = run_reviewer(conn, config, job.id, agent_bin=str(reviewer))
+        stored = get_job(conn, job.id)
     finally:
         conn.close()
 
     assert outcome.failure == "response had no JSON report"
     assert outcome.run.status == RunStatus.failed
-    assert stored is not None and stored.status == TaskStatus.review
+    assert outcome.job.role == JobRole.reviewer
+    assert outcome.job.status == JobStatus.failed
+    assert outcome.job.result is None
+    assert stored is not None and stored.status == JobStatus.completed
+    assert stored.integration == Integration.pending
+    assert stored.result is not None
 
 
 def _worker_script() -> str:

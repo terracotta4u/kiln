@@ -5,9 +5,9 @@ from pathlib import Path
 from kiln.errors import KilnError
 from kiln.models import Event
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 1
 
-SCHEMA_V1 = """
+SCHEMA = """
 CREATE TABLE goals (
     id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
@@ -20,15 +20,20 @@ CREATE TABLE goals (
     evidence TEXT
 );
 
-CREATE TABLE tasks (
+CREATE TABLE jobs (
     id INTEGER PRIMARY KEY,
     goal_id INTEGER NOT NULL REFERENCES goals(id),
+    role TEXT NOT NULL CHECK (role IN ('scout', 'worker', 'reviewer')),
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     acceptance TEXT NOT NULL DEFAULT '',
+    question TEXT NOT NULL DEFAULT '',
+    focus TEXT NOT NULL DEFAULT '',
+    target_job_id INTEGER REFERENCES jobs(id),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (
-        status IN ('pending', 'claimed', 'running', 'review', 'done', 'failed', 'cancelled')
+        status IN ('pending', 'claimed', 'running', 'completed', 'failed', 'cancelled')
     ),
+    integration TEXT CHECK (integration IS NULL OR integration IN ('pending', 'merged', 'rejected')),
     priority INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -36,19 +41,20 @@ CREATE TABLE tasks (
     worktree_path TEXT,
     claimed_by TEXT,
     feedback TEXT,
+    result TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE task_deps (
-    task_id INTEGER NOT NULL REFERENCES tasks(id),
-    depends_on INTEGER NOT NULL REFERENCES tasks(id),
-    PRIMARY KEY (task_id, depends_on)
+CREATE TABLE job_deps (
+    job_id INTEGER NOT NULL REFERENCES jobs(id),
+    depends_on INTEGER NOT NULL REFERENCES jobs(id),
+    PRIMARY KEY (job_id, depends_on)
 );
 
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
-    task_id INTEGER REFERENCES tasks(id),
+    job_id INTEGER REFERENCES jobs(id),
     role TEXT NOT NULL,
     model TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -70,31 +76,15 @@ CREATE TABLE events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
     kind TEXT NOT NULL,
-    task_id INTEGER REFERENCES tasks(id),
+    job_id INTEGER REFERENCES jobs(id),
     run_id INTEGER REFERENCES runs(id),
     message TEXT NOT NULL
 );
 
-CREATE TABLE scout_requests (
-    id INTEGER PRIMARY KEY,
-    goal_id INTEGER NOT NULL REFERENCES goals(id),
-    question TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX idx_tasks_goal ON tasks(goal_id);
-CREATE INDEX idx_tasks_status ON tasks(status);
-CREATE INDEX idx_task_deps_depends_on ON task_deps(depends_on);
+CREATE INDEX idx_jobs_goal ON jobs(goal_id);
+CREATE INDEX idx_jobs_status ON jobs(status);
+CREATE INDEX idx_job_deps_depends_on ON job_deps(depends_on);
 CREATE INDEX idx_events_ts ON events(ts);
-"""
-
-SCHEMA_V2 = """
-CREATE TABLE IF NOT EXISTS scout_requests (
-    id INTEGER PRIMARY KEY,
-    goal_id INTEGER NOT NULL REFERENCES goals(id),
-    question TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
 """
 
 
@@ -119,29 +109,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             f"database version {version} is newer than this kiln (supports {SCHEMA_VERSION})"
         )
     if version < 1:
-        conn.executescript(SCHEMA_V1)
-        conn.execute("PRAGMA user_version = 1")
-        version = 1
-    if version < 2:
-        conn.executescript(SCHEMA_V2)
-        conn.execute("PRAGMA user_version = 2")
-        version = 2
-    if version < 3:
-        _add_column(conn, "goals", "branch", "TEXT")
-        _add_column(conn, "goals", "pr_url", "TEXT")
-        conn.execute("PRAGMA user_version = 3")
-        version = 3
-    if version < 4:
-        _add_column(conn, "goals", "brief", "TEXT")
-        _add_column(conn, "goals", "evidence", "TEXT")
-        conn.execute("PRAGMA user_version = 4")
-
-
-def _add_column(conn: sqlite3.Connection, table: str, name: str, declaration: str) -> None:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    if any(row["name"] == name for row in rows):
-        return
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        conn.executescript(SCHEMA)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def list_events(conn: sqlite3.Connection, *, limit: int) -> list[Event]:
@@ -159,10 +128,10 @@ def record_event(
     kind: str,
     message: str,
     *,
-    task_id: int | None = None,
+    job_id: int | None = None,
     run_id: int | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO events (ts, kind, task_id, run_id, message) VALUES (?, ?, ?, ?, ?)",
-        (utc_now(), kind, task_id, run_id, message),
+        "INSERT INTO events (ts, kind, job_id, run_id, message) VALUES (?, ?, ?, ?, ?)",
+        (utc_now(), kind, job_id, run_id, message),
     )
