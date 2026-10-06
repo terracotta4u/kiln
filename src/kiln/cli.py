@@ -1,4 +1,5 @@
 import json
+import time
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -10,6 +11,8 @@ from kiln import __version__
 from kiln.config import Config, init_factory, load_config
 from kiln.db import connect, list_events, migrate
 from kiln.errors import KilnError
+from kiln.server.client import Client, is_running, start_detached
+from kiln.server.server import serve
 from kiln.gc import cleanup
 from kiln.jobs import (
     add_dependency,
@@ -36,9 +39,11 @@ app = typer.Typer(no_args_is_help=True, help="Kiln: an automated software factor
 goal_app = typer.Typer(no_args_is_help=True, help="Manage goals.")
 job_app = typer.Typer(no_args_is_help=True, help="Manage jobs.")
 runs_app = typer.Typer(no_args_is_help=True, help="Inspect agent runs.")
+server_app = typer.Typer(no_args_is_help=True, help="The server that owns running factories.")
 app.add_typer(goal_app, name="goal")
 app.add_typer(job_app, name="job")
 app.add_typer(runs_app, name="runs")
+app.add_typer(server_app, name="server")
 
 
 def _version(value: bool) -> None:
@@ -72,6 +77,68 @@ def init() -> None:
     else:
         typer.echo(f"{config.toml_path} already exists; left unchanged")
     typer.echo(f"database {config.db_path}")
+
+
+@server_app.command("start")
+def server_start() -> None:
+    """Start the Kiln server in the background. Harmless if it is already running."""
+    try:
+        if is_running():
+            info = Client().ping()
+            typer.echo(f"kiln server already running (pid {info['pid']})")
+            return
+        info = start_detached()
+    except KilnError as exc:
+        _fail(exc)
+    typer.echo(f"kiln server started (pid {info['pid']})")
+
+
+@server_app.command("status")
+def server_status() -> None:
+    """Report whether the Kiln server is running."""
+    if not is_running():
+        typer.echo("not running")
+        return
+    try:
+        info = Client().server_status()
+    except KilnError as exc:
+        _fail(exc)
+    count = sum(1 for factory in info["factories"] if factory["state"] == "running")
+    noun = "factory" if count == 1 else "factories"
+    typer.echo(f"running (pid {info['pid']}, {count} {noun})")
+
+
+@server_app.command("stop")
+def server_stop(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Stop running factories and kill their agents, then exit.",
+    ),
+) -> None:
+    """Stop the Kiln server. Refuses while a factory is running unless --force."""
+    if not is_running():
+        typer.echo("not running")
+        return
+    try:
+        Client().stop_server(force=force)
+    except KilnError as exc:
+        _fail(exc)
+    deadline = time.monotonic() + 20
+    while is_running() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if is_running():
+        _fail(KilnError("kiln server did not exit"))
+    typer.echo("kiln server stopped")
+
+
+@server_app.command("serve", hidden=True)
+def server_serve() -> None:
+    """Run the server in the foreground. `kiln server start` launches this."""
+    try:
+        serve()
+    except KilnError as exc:
+        _fail(exc)
 
 
 @app.command()
