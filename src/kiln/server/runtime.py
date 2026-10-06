@@ -148,22 +148,22 @@ class FactoryRuntime:
                 should_stop=factory.stop_event.is_set,
             )
             if result.stop_reason is None:
-                self._finish(factory, COMPLETED, None, None)
                 record_event(conn, "factory.completed", "factory completed")
+                self._finish(factory, COMPLETED, None, None)
             else:
-                self._finish(factory, STOPPED, result.stop_reason, None)
                 record_event(
                     conn,
                     "factory.stopped",
                     f"factory stopped ({result.stop_reason})",
                 )
+                self._finish(factory, STOPPED, result.stop_reason, None)
         except Exception as exc:
-            self._finish(factory, FAILED, None, str(exc))
             if conn is not None:
                 try:
                     record_event(conn, "factory.failed", f"factory failed: {exc}")
                 except Exception:
                     pass
+            self._finish(factory, FAILED, None, str(exc))
         finally:
             if conn is not None:
                 conn.close()

@@ -244,14 +244,11 @@ def run(
             turns=turns,
             agent_bin=os.environ.get("KILN_AGENT_BIN"),
         )
-    except KilnError as exc:
-        _fail(exc)
-    if not started["started"]:
-        typer.echo(
-            f"factory already running for {config.repo_root} "
-            f"since {started['factory']['started_at']}; attaching"
-        )
-    try:
+        if not started["started"]:
+            typer.echo(
+                f"factory already running for {config.repo_root} "
+                f"since {started['factory']['started_at']}; attaching"
+            )
         _follow(client, config.repo_root, int(started["cursor"]))
     except KeyboardInterrupt:
         typer.echo("detached; the factory keeps running. Reconnect with `kiln attach`.")

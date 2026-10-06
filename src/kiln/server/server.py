@@ -93,6 +93,10 @@ class KilnServer(socketserver.ThreadingUnixStreamServer):
             raise KilnError("after must be an integer >= 0")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise KilnError("limit must be an integer >= 1")
+        # State is published after the terminal event is committed, and read
+        # before the event query, so a client that sees a finished factory also
+        # sees the event that recorded it.
+        factory = factory_payload(self.runtime.status(repo), repo)
         config = load_config(repo)
         conn = connect(config.db_path)
         try:
@@ -100,10 +104,7 @@ class KilnServer(socketserver.ThreadingUnixStreamServer):
             rows = events_after(conn, after, limit=min(limit, _EVENT_LIMIT))
         finally:
             conn.close()
-        return ok(
-            events=[_event_dict(row) for row in rows],
-            factory=factory_payload(self.runtime.status(repo), repo),
-        )
+        return ok(events=[_event_dict(row) for row in rows], factory=factory)
 
     def _stop(self, message: dict) -> dict:
         force = bool(message.get("force"))
