@@ -11,7 +11,6 @@ from kiln.db import connect, migrate, record_event
 from kiln.errors import KilnError
 from kiln.git import goal_branch_name
 from kiln.jobs import (
-    add_dependency,
     add_job,
     cancel_job,
     dependencies,
@@ -577,26 +576,13 @@ def _create_job(
         if "target_job_id" not in action or action.get("target_job_id") is None:
             raise KilnError("reviewer job requires a target_job_id")
         target_id = _resolve_dep(conn, goal.id, action.get("target_job_id"), refs)
+    _reject_self_dependency(action, depends_on, refs)
+    linked = [_resolve_dep(conn, goal.id, dep, refs) for dep in depends_on]
+    if len(linked) != len(set(linked)):
+        raise KilnError("depends_on lists the same job more than once")
+    if role == JobRole.reviewer and target_id not in linked:
+        raise KilnError("reviewer target must be listed in depends_on")
     description = _optional_text(action, "description")
-    if role == JobRole.reviewer:
-        linked = [_resolve_dep(conn, goal.id, dep, refs) for dep in depends_on]
-        if target_id not in linked:
-            raise KilnError("reviewer target must be listed in depends_on")
-        job = add_job(
-            conn,
-            goal.id,
-            title,
-            role=role,
-            description=description,
-            focus=focus,
-            target_job_id=target_id,
-            depends_on=linked,
-            priority=_priority(action),
-            max_attempts=config.max_attempts,
-        )
-        _remember(refs, action, job.id, job.title)
-        deps = ", ".join(f"#{dep_id}" for dep_id in linked)
-        return f"created job #{job.id} {job.title} depending on {deps}"
     job = add_job(
         conn,
         goal.id,
@@ -605,24 +591,27 @@ def _create_job(
         description=description,
         acceptance=acceptance,
         question=question,
+        focus=focus,
+        target_job_id=target_id,
+        depends_on=linked,
         priority=_priority(action),
         max_attempts=config.max_attempts,
     )
     _remember(refs, action, job.id, job.title)
-    linked: list[int] = []
-    for dep in depends_on:
-        try:
-            dep_id = _resolve_dep(conn, goal.id, dep, refs)
-            if dep_id == job.id:
-                raise KilnError(f"job #{job.id} cannot depend on itself")
-            add_dependency(conn, job.id, dep_id)
-        except KilnError as exc:
-            return f"created job #{job.id} {job.title}; dependency failed: {exc}"
-        linked.append(dep_id)
     if linked:
         deps = ", ".join(f"#{dep_id}" for dep_id in linked)
         return f"created job #{job.id} {job.title} depending on {deps}"
     return f"created job #{job.id} {job.title}"
+
+
+def _reject_self_dependency(action: dict, depends_on: list[object], refs: dict[str, int]) -> None:
+    ref = action.get("ref")
+    if not isinstance(ref, str) or not ref.strip() or ref.strip() in refs:
+        return
+    name = ref.strip()
+    for dep in depends_on:
+        if isinstance(dep, str) and dep.strip() == name:
+            raise KilnError("a job cannot depend on itself")
 
 
 def _remember(refs: dict[str, int], action: dict, job_id: int, title: str) -> None:

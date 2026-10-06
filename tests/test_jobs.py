@@ -12,6 +12,7 @@ from kiln.jobs import (
     claim_job,
     claim_next,
     complete_job,
+    list_jobs,
     ready_jobs,
     reject_job,
     rework_job,
@@ -290,6 +291,15 @@ def test_diamond_dependencies_are_allowed(conn):
     add_dependency(conn, leaf.id, left.id)
     add_dependency(conn, leaf.id, right.id)
     add_dependency(conn, left.id, right.id)
+
+
+def test_add_job_rolls_back_when_a_dependency_is_rejected(conn):
+    first = add_goal(conn, "One")
+    second = add_goal(conn, "Two")
+    foreign = add_job(conn, second.id, "Foreign")
+    with pytest.raises(KilnError, match="different goals"):
+        add_job(conn, first.id, "Local", depends_on=[foreign.id])
+    assert list_jobs(conn, goal_id=first.id) == []
 
 
 def test_dependency_must_share_a_goal(conn):

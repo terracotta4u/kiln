@@ -155,35 +155,41 @@ def add_job(
     deps = list(depends_on or [])
     _check_target(conn, goal_id, role, target_job_id, deps)
     now = utc_now()
-    cur = conn.execute(
-        """
-        INSERT INTO jobs (
-            goal_id, role, title, description, acceptance, question, focus, target_job_id,
-            status, priority, attempts, max_attempts, created_at, updated_at
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO jobs (
+                goal_id, role, title, description, acceptance, question, focus, target_job_id,
+                status, priority, attempts, max_attempts, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                role.value,
+                title,
+                description,
+                acceptance,
+                question,
+                focus,
+                target_job_id,
+                JobStatus.pending.value,
+                priority,
+                max_attempts,
+                now,
+                now,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-        """,
-        (
-            goal_id,
-            role.value,
-            title,
-            description,
-            acceptance,
-            question,
-            focus,
-            target_job_id,
-            JobStatus.pending.value,
-            priority,
-            max_attempts,
-            now,
-            now,
-        ),
-    )
-    job = require_job(conn, cur.lastrowid)
-    for dep_id in deps:
-        add_dependency(conn, job.id, dep_id)
-    record_event(conn, "job.created", f"created job #{job.id} {job.role.value} {job.title}", job_id=job.id)
-    return job
+        job_id = int(cur.lastrowid)
+        for dep_id in deps:
+            _link_dependency(conn, job_id, dep_id)
+        record_event(conn, "job.created", f"created job #{job_id} {role.value} {title}", job_id=job_id)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return require_job(conn, job_id)
 
 
 def get_job(conn: sqlite3.Connection, job_id: int) -> Job | None:
@@ -264,29 +270,33 @@ def add_dependency(conn: sqlite3.Connection, job_id: int, depends_on: int) -> No
     """Record that job_id cannot start until depends_on is satisfied."""
     conn.execute("BEGIN IMMEDIATE")
     try:
-        job = require_job(conn, job_id)
-        dep = require_job(conn, depends_on)
-        if job.goal_id != dep.goal_id:
-            raise KilnError(f"jobs #{job_id} and #{depends_on} are in different goals")
-        if _reaches(conn, depends_on, job_id):
-            raise KilnError(f"job #{job_id} depending on #{depends_on} would create a cycle")
-        try:
-            conn.execute(
-                "INSERT INTO job_deps (job_id, depends_on) VALUES (?, ?)",
-                (job_id, depends_on),
-            )
-        except sqlite3.IntegrityError as exc:
-            raise KilnError(f"job #{job_id} already depends on #{depends_on}") from exc
-        record_event(
-            conn,
-            "job.dependency",
-            f"job #{job_id} depends on #{depends_on}",
-            job_id=job_id,
-        )
+        _link_dependency(conn, job_id, depends_on)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _link_dependency(conn: sqlite3.Connection, job_id: int, depends_on: int) -> None:
+    job = require_job(conn, job_id)
+    dep = require_job(conn, depends_on)
+    if job.goal_id != dep.goal_id:
+        raise KilnError(f"jobs #{job_id} and #{depends_on} are in different goals")
+    if _reaches(conn, depends_on, job_id):
+        raise KilnError(f"job #{job_id} depending on #{depends_on} would create a cycle")
+    try:
+        conn.execute(
+            "INSERT INTO job_deps (job_id, depends_on) VALUES (?, ?)",
+            (job_id, depends_on),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise KilnError(f"job #{job_id} already depends on #{depends_on}") from exc
+    record_event(
+        conn,
+        "job.dependency",
+        f"job #{job_id} depends on #{depends_on}",
+        job_id=job_id,
+    )
 
 
 def claim_job(conn: sqlite3.Connection, job_id: int, worker: str) -> Job | None:

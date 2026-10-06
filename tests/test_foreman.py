@@ -267,17 +267,35 @@ def test_goal_brief_shows_the_brief_and_what_is_ready(tmp_path):
     conn.close()
 
 
-def test_bad_dependency_keeps_the_created_task(tmp_path):
+def test_a_failed_dependency_leaves_no_job(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
+    existing = add_job(conn, goal.id, "Schema")
     messages = apply_actions(
         conn,
         _config(),
         goal,
-        [{"type": "create_job", "role": "worker", "title": "CLI", "depends_on": ["missing"]}],
+        [
+            {
+                "type": "create_job",
+                "ref": "impl",
+                "role": "worker",
+                "title": "Implement thing",
+                "depends_on": ["nonexistent-scout"],
+            },
+            {"type": "dispatch", "ref": "impl"},
+            {
+                "type": "create_job",
+                "role": "worker",
+                "title": "CLI",
+                "depends_on": [existing.id, "missing"],
+            },
+        ],
     )
-    assert "dependency failed" in messages[0]
-    assert [task.title for task in list_jobs(conn, goal_id=goal.id)] == ["CLI"]
+    assert "unknown dependency" in messages[0]
+    assert "action needs a job_id or ref" in messages[1]
+    assert "unknown dependency" in messages[2]
+    assert [job.title for job in list_jobs(conn, goal_id=goal.id)] == ["Schema"]
     conn.close()
 
 
