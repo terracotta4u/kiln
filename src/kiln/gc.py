@@ -8,11 +8,8 @@ from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
 from kiln.git import branch_exists, delete_branch, prune_worktrees, remove_worktree
-from kiln.models import Task, TaskStatus
-from kiln.tasks import forget_checkout, list_tasks
-
-_FINISHED = (TaskStatus.done, TaskStatus.failed, TaskStatus.cancelled)
-_LIVE = (TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review)
+from kiln.jobs import forget_checkout, is_open, list_jobs
+from kiln.models import Integration, Job
 
 
 def cleanup(conn: sqlite3.Connection, config: Config, *, dry_run: bool = False) -> list[str]:
@@ -21,10 +18,10 @@ def cleanup(conn: sqlite3.Connection, config: Config, *, dry_run: bool = False) 
     A done task's branch is deleted only when delete_merged_branches is set.
     Failed and cancelled tasks keep their branch so the work can still be inspected.
     """
-    tasks = list_tasks(conn)
+    tasks = list_jobs(conn)
     lines: list[str] = []
     for task in tasks:
-        if task.status not in _FINISHED:
+        if is_open(task):
             continue
         lines.extend(_release_task(conn, config, task, dry_run=dry_run))
     lines.extend(_sweep_directories(config, tasks, dry_run=dry_run))
@@ -37,16 +34,16 @@ def cleanup(conn: sqlite3.Connection, config: Config, *, dry_run: bool = False) 
     return lines
 
 
-def _release_task(conn: sqlite3.Connection, config: Config, task: Task, *, dry_run: bool) -> list[str]:
+def _release_task(conn: sqlite3.Connection, config: Config, task: Job, *, dry_run: bool) -> list[str]:
     lines: list[str] = []
     if task.worktree_path:
         lines.extend(_release_worktree(conn, config, task, dry_run=dry_run))
-    if task.status == TaskStatus.done and config.delete_merged_branches and task.branch:
+    if task.integration == Integration.merged and config.delete_merged_branches and task.branch:
         lines.extend(_release_branch(conn, config, task, dry_run=dry_run))
     return lines
 
 
-def _release_worktree(conn: sqlite3.Connection, config: Config, task: Task, *, dry_run: bool) -> list[str]:
+def _release_worktree(conn: sqlite3.Connection, config: Config, task: Job, *, dry_run: bool) -> list[str]:
     path = Path(task.worktree_path or "")
     if not _inside(config.worktrees_dir, path):
         return [f"left worktree for task #{task.id} in place ({path})"]
@@ -64,7 +61,7 @@ def _release_worktree(conn: sqlite3.Connection, config: Config, task: Task, *, d
     return [f"removed worktree for task #{task.id}"]
 
 
-def _release_branch(conn: sqlite3.Connection, config: Config, task: Task, *, dry_run: bool) -> list[str]:
+def _release_branch(conn: sqlite3.Connection, config: Config, task: Job, *, dry_run: bool) -> list[str]:
     branch = task.branch or ""
     if not branch.startswith("kiln/") or branch == config.base_branch:
         return [f"left branch {branch} for task #{task.id} in place"]
@@ -82,15 +79,15 @@ def _release_branch(conn: sqlite3.Connection, config: Config, task: Task, *, dry
     return [f"deleted branch {branch} for task #{task.id}"]
 
 
-def _sweep_directories(config: Config, tasks: list[Task], *, dry_run: bool) -> list[str]:
+def _sweep_directories(config: Config, tasks: list[Job], *, dry_run: bool) -> list[str]:
     root = config.worktrees_dir
     if not root.is_dir():
         return []
-    live_ids = {task.id for task in tasks if task.status in _LIVE}
+    live_ids = {task.id for task in tasks if is_open(task)}
     live_paths = {
         Path(task.worktree_path).resolve()
         for task in tasks
-        if task.status in _LIVE and task.worktree_path
+        if is_open(task) and task.worktree_path
     }
     lines: list[str] = []
     for path in sorted(root.iterdir()):

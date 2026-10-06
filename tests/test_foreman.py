@@ -1,15 +1,17 @@
 from kiln.db import connect, migrate
-from kiln.models import GoalStatus, TaskStatus
-from kiln.roles.foreman import apply_actions, goal_brief
-from kiln.tasks import (
+from kiln.jobs import (
     add_dependency,
     add_goal,
-    add_task,
-    get_task,
-    list_tasks,
+    add_job,
+    get_job,
+    list_jobs,
     require_goal,
-    set_task_status,
+    set_goal_brief,
+    set_integration,
+    set_job_status,
 )
+from kiln.models import GoalStatus, Integration, JobStatus
+from kiln.roles.foreman import apply_actions, goal_brief
 
 
 def test_apply_creates_a_dependency_chain(tmp_path):
@@ -37,11 +39,11 @@ def test_apply_creates_a_dependency_chain(tmp_path):
             },
         ],
     )
-    tasks = list_tasks(conn, goal_id=goal.id)
+    tasks = list_jobs(conn, goal_id=goal.id)
     assert [task.title for task in tasks] == ["Schema", "CLI"]
     assert tasks[0].priority == 2
     assert "depending on #1" in messages[1]
-    ready = [task.title for task in tasks if task.status == TaskStatus.pending]
+    ready = [task.title for task in tasks if task.status == JobStatus.pending]
     assert ready == ["Schema", "CLI"]
     conn.close()
 
@@ -49,7 +51,7 @@ def test_apply_creates_a_dependency_chain(tmp_path):
 def test_apply_notes_brief_and_goal_done(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    task = add_task(conn, goal.id, "Schema")
+    task = add_job(conn, goal.id, "Schema")
     messages = apply_actions(
         conn,
         _config(),
@@ -63,10 +65,10 @@ def test_apply_notes_brief_and_goal_done(tmp_path):
             {"type": "frobnicate"},
         ],
     )
-    stored = get_task(conn, task.id)
+    stored = get_job(conn, task.id)
     finished = require_goal(conn, goal.id)
     assert any(message.startswith("note #") for message in messages)
-    assert stored is not None and stored.status == TaskStatus.cancelled
+    assert stored is not None and stored.status == JobStatus.cancelled
     assert finished.brief == "Success: the schema exists."
     assert any("requires evidence" in message for message in messages)
     assert finished.status == GoalStatus.done
@@ -78,7 +80,7 @@ def test_apply_notes_brief_and_goal_done(tmp_path):
 def test_goal_done_waits_for_open_tasks(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    add_task(conn, goal.id, "Schema")
+    add_job(conn, goal.id, "Schema")
     messages = apply_actions(
         conn,
         _config(),
@@ -94,8 +96,8 @@ def test_goal_done_waits_for_open_tasks(tmp_path):
 def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    first = add_task(conn, goal.id, "Schema")
-    second = add_task(conn, goal.id, "CLI")
+    first = add_job(conn, goal.id, "Schema")
+    second = add_job(conn, goal.id, "CLI")
     add_dependency(conn, second.id, first.id)
     limited = apply_actions(
         conn,
@@ -111,10 +113,10 @@ def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
     review = apply_actions(conn, _config(), goal, [{"type": "review", "task_id": first.id}])
     assert limited == ["limit reached, dispatch next turn", "limit reached, dispatch next turn"]
     assert "blocked" in blocked[0]
-    assert "only a task in review" in review[0]
-    assert [task.status for task in list_tasks(conn, goal_id=goal.id)] == [
-        TaskStatus.pending,
-        TaskStatus.pending,
+    assert "pending integration" in review[0]
+    assert [task.status for task in list_jobs(conn, goal_id=goal.id)] == [
+        JobStatus.pending,
+        JobStatus.pending,
     ]
     conn.close()
 
@@ -122,12 +124,12 @@ def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
 def test_review_and_a_decision_in_one_turn_are_refused(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    first = add_task(conn, goal.id, "Schema")
-    second = add_task(conn, goal.id, "CLI")
-    third = add_task(conn, goal.id, "Docs")
-    set_task_status(conn, first.id, TaskStatus.review)
-    set_task_status(conn, second.id, TaskStatus.review)
-    set_task_status(conn, third.id, TaskStatus.review)
+    first = add_job(conn, goal.id, "Schema")
+    second = add_job(conn, goal.id, "CLI")
+    third = add_job(conn, goal.id, "Docs")
+    for job in (first, second, third):
+        set_job_status(conn, job.id, JobStatus.completed)
+        set_integration(conn, job.id, Integration.pending)
     messages = apply_actions(
         conn,
         _config(),
@@ -147,21 +149,21 @@ def test_review_and_a_decision_in_one_turn_are_refused(tmp_path):
     assert messages[3] == f"action 4 failed: cannot review and approve, rework, or fail task #{second.id} in one turn"
     assert messages[4] == f"action 5 failed: cannot review and approve, rework, or fail task #{second.id} in one turn"
     assert messages[5] == f"task #{third.id} failed"
-    stored = [get_task(conn, task_id) for task_id in (first.id, second.id, third.id)]
-    assert stored[0] is not None and stored[0].status == TaskStatus.review
-    assert stored[1] is not None and stored[1].status == TaskStatus.review
-    assert stored[2] is not None and stored[2].status == TaskStatus.failed
+    stored = [get_job(conn, task_id) for task_id in (first.id, second.id, third.id)]
+    assert stored[0] is not None and stored[0].status == JobStatus.completed
+    assert stored[0].integration == Integration.pending
+    assert stored[1] is not None and stored[1].status == JobStatus.completed
+    assert stored[1].integration == Integration.pending
+    assert stored[2] is not None and stored[2].status == JobStatus.failed
     conn.close()
 
 
 def test_goal_brief_shows_the_brief_and_what_is_ready(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    from kiln.tasks import set_goal_brief
-
     set_goal_brief(conn, goal.id, "Success: both tasks land.")
-    first = add_task(conn, goal.id, "Schema")
-    second = add_task(conn, goal.id, "CLI")
+    first = add_job(conn, goal.id, "Schema")
+    second = add_job(conn, goal.id, "CLI")
     add_dependency(conn, second.id, first.id)
     text = goal_brief(conn, _config(), require_goal(conn, goal.id))
     assert "Success: both tasks land." in text
@@ -181,7 +183,7 @@ def test_bad_dependency_keeps_the_created_task(tmp_path):
         [{"type": "create_task", "title": "CLI", "depends_on": ["missing"]}],
     )
     assert "dependency failed" in messages[0]
-    assert [task.title for task in list_tasks(conn, goal_id=goal.id)] == ["CLI"]
+    assert [task.title for task in list_jobs(conn, goal_id=goal.id)] == ["CLI"]
     conn.close()
 
 
@@ -189,12 +191,12 @@ def test_actions_cannot_touch_another_goal(tmp_path):
     conn = _db(tmp_path)
     first = add_goal(conn, "One")
     second = add_goal(conn, "Two")
-    task = add_task(conn, second.id, "Elsewhere")
-    set_task_status(conn, task.id, TaskStatus.review)
+    task = add_job(conn, second.id, "Elsewhere")
+    set_job_status(conn, task.id, JobStatus.completed)
     messages = apply_actions(conn, _config(), first, [{"type": "fail", "task_id": task.id, "reason": "no"}])
     assert "not in goal" in messages[0]
-    stored = get_task(conn, task.id)
-    assert stored is not None and stored.status == TaskStatus.review
+    stored = get_job(conn, task.id)
+    assert stored is not None and stored.status == JobStatus.completed
     conn.close()
 
 
@@ -226,6 +228,4 @@ def _config():
 
 
 def get_goal_status(conn, goal_id):
-    from kiln.tasks import require_goal
-
     return require_goal(conn, goal_id).status

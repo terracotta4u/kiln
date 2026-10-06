@@ -10,20 +10,20 @@ from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
 from kiln.git import branch_name, commit_if_dirty, diffstat, ensure_worktree
-from kiln.models import Run, RunStatus, Task, TaskStatus
+from kiln.jobs import (
+    claim_job,
+    complete_job,
+    fail_job,
+    ready_jobs,
+    release_claim,
+    require_goal,
+    require_job,
+    start_attempt,
+)
+from kiln.models import Job, JobStatus, Run, RunStatus
 from kiln.prompts import render_prompt
 from kiln.publish import ensure_goal_branch
 from kiln.runs import finish_run, start_run
-from kiln.tasks import (
-    claim_task,
-    fail_task,
-    ready_tasks,
-    release_claim,
-    require_goal,
-    require_task,
-    set_task_status,
-    start_attempt,
-)
 
 VERIFY_TIMEOUT_SECONDS = 300
 _VERIFY_OUTPUT_LIMIT = 4000
@@ -31,7 +31,7 @@ _VERIFY_OUTPUT_LIMIT = 4000
 
 @dataclass(frozen=True)
 class WorkerOutcome:
-    task: Task
+    job: Job
     run: Run
     failure: str | None
     diffstat: str
@@ -62,7 +62,7 @@ def run_worker(
     if reporter:
         reporter(f"working task #{task.id} on {branch}")
     goal = require_goal(conn, task.goal_id)
-    run = start_run(conn, role="worker", model=config.models.worker, task_id=task.id)
+    run = start_run(conn, role="worker", model=config.models.worker, job_id=task.id)
     prompt = render_prompt(
         "worker.md",
         {
@@ -136,12 +136,12 @@ def run_worker(
         log_path=str(config.runs_dir / f"{run.id}.log"),
         report=report,
     )
-    task = set_task_status(conn, task.id, TaskStatus.review)
+    task = complete_job(conn, task.id, report)
     record_event(
         conn,
         "worker.failed" if failure else "worker.completed",
-        failure or f"task #{task.id} is ready for review",
-        task_id=task.id,
+        failure or f"job #{task.id} completed",
+        job_id=task.id,
         run_id=finished.id,
     )
     summary = ""
@@ -149,7 +149,7 @@ def run_worker(
     if isinstance(worker_report, dict) and isinstance(worker_report.get("summary"), str):
         summary = worker_report["summary"]
     return WorkerOutcome(
-        task=task,
+        job=task,
         run=finished,
         failure=failure,
         diffstat=changes,
@@ -157,28 +157,28 @@ def run_worker(
     )
 
 
-def _claim(conn: sqlite3.Connection, task_id: int | None, worker: str) -> Task:
+def _claim(conn: sqlite3.Connection, task_id: int | None, worker: str) -> Job:
     if task_id is not None:
-        task = require_task(conn, task_id)
-        if task.status == TaskStatus.pending and task.attempts >= task.max_attempts:
-            fail_task(conn, task.id, f"exhausted {task.max_attempts} attempts")
+        task = require_job(conn, task_id)
+        if task.status == JobStatus.pending and task.attempts >= task.max_attempts:
+            fail_job(conn, task.id, f"exhausted {task.max_attempts} attempts")
             raise KilnError(f"task #{task.id} exhausted {task.max_attempts} attempts")
-        claimed = claim_task(conn, task.id, worker)
+        claimed = claim_job(conn, task.id, worker)
         if claimed is None:
             raise KilnError(f"task #{task.id} is not ready")
         return claimed
 
     while True:
-        ready = ready_tasks(conn)
+        ready = ready_jobs(conn)
         if not ready:
             raise KilnError("no ready task")
         candidate = ready[0]
         if candidate.attempts >= candidate.max_attempts:
-            fail_task(conn, candidate.id, f"exhausted {candidate.max_attempts} attempts")
+            fail_job(conn, candidate.id, f"exhausted {candidate.max_attempts} attempts")
             if len(ready) == 1:
                 raise KilnError(f"task #{candidate.id} exhausted {candidate.max_attempts} attempts")
             continue
-        claimed = claim_task(conn, candidate.id, worker)
+        claimed = claim_job(conn, candidate.id, worker)
         if claimed is not None:
             return claimed
 

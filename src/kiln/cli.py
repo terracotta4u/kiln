@@ -11,25 +11,26 @@ from kiln.config import Config, init_factory, load_config
 from kiln.db import connect, list_events, migrate
 from kiln.errors import KilnError
 from kiln.gc import cleanup
-from kiln.models import Event, Goal, Run, Task, TaskStatus
+from kiln.jobs import (
+    add_dependency,
+    add_goal,
+    add_job,
+    cancel_job,
+    dependencies,
+    dependents,
+    is_open,
+    list_goals,
+    list_jobs,
+    ready_jobs,
+    require_goal,
+    require_job,
+)
+from kiln.models import Event, Goal, Job, JobStatus, Run
 from kiln.review import approve_task, reject_task, send_back
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
 from kiln.runs import require_run
 from kiln.tick import run_tick, run_until_done
-from kiln.tasks import (
-    add_dependency,
-    add_goal,
-    add_task,
-    cancel_task,
-    dependencies,
-    dependents,
-    list_goals,
-    list_tasks,
-    ready_tasks,
-    require_goal,
-    require_task,
-)
 
 app = typer.Typer(no_args_is_help=True, help="Kiln: an automated software factory for one repo.")
 goal_app = typer.Typer(no_args_is_help=True, help="Manage goals.")
@@ -106,9 +107,9 @@ def work(
     def render(config: Config, conn) -> None:
         outcome = run_worker(conn, config, task_id=task, reporter=typer.echo)
         typer.echo(
-            f"task #{outcome.task.id}  {outcome.task.status.value}  {outcome.task.branch}"
+            f"task #{outcome.job.id}  {outcome.job.status.value}  {outcome.job.branch}"
         )
-        typer.echo(f"attempts  {outcome.task.attempts}/{outcome.task.max_attempts}")
+        typer.echo(f"attempts  {outcome.job.attempts}/{outcome.job.max_attempts}")
         if outcome.run.log_path:
             typer.echo(f"log  {outcome.run.log_path}")
         if outcome.summary:
@@ -116,7 +117,7 @@ def work(
         if outcome.diffstat:
             typer.echo(f"\n{outcome.diffstat}")
         if outcome.failure:
-            raise KilnError(f"task #{outcome.task.id} is in review: {outcome.failure}")
+            raise KilnError(f"task #{outcome.job.id} completed with a problem: {outcome.failure}")
 
     _with_db(render)
 
@@ -253,25 +254,25 @@ def status() -> None:
         if not goals:
             typer.echo("no goals")
             return
-        tasks = list_tasks(conn)
-        by_goal: dict[int, list[Task]] = {goal.id: [] for goal in goals}
+        tasks = list_jobs(conn)
+        by_goal: dict[int, list[Job]] = {goal.id: [] for goal in goals}
         for task in tasks:
             by_goal.setdefault(task.goal_id, []).append(task)
         for goal in goals:
             counts = Counter(task.status for task in by_goal.get(goal.id, []))
             summary = ", ".join(
-                f"{counts[state]} {state.value}" for state in TaskStatus if counts[state]
+                f"{counts[state]} {state.value}" for state in JobStatus if counts[state]
             )
             typer.echo(f"\n#{goal.id}  {goal.status.value}  {goal.title}")
             typer.echo(f"    {summary or 'no tasks'}")
 
-        ready = ready_tasks(conn)
+        ready = ready_jobs(conn)
         ready_ids = {task.id for task in ready}
         typer.echo("\nready")
         _echo_task_lines(ready)
 
         blocked = [
-            task for task in tasks if task.status == TaskStatus.pending and task.id not in ready_ids
+            task for task in tasks if task.status == JobStatus.pending and task.id not in ready_ids
         ]
         if blocked:
             typer.echo("\nblocked")
@@ -282,7 +283,7 @@ def status() -> None:
         inflight = [
             task
             for task in tasks
-            if task.status in (TaskStatus.claimed, TaskStatus.running, TaskStatus.review)
+            if is_open(task) and task.status != JobStatus.pending
         ]
         if inflight:
             typer.echo("\nin progress")
@@ -327,7 +328,7 @@ def goal_show(goal_id: int = typer.Argument(help="Goal id.")) -> None:
     def render(_config: Config, conn) -> None:
         goal = require_goal(conn, goal_id)
         _echo_goal(goal)
-        tasks = list_tasks(conn, goal_id=goal.id)
+        tasks = list_jobs(conn, goal_id=goal.id)
         typer.echo("\ntasks")
         _echo_task_lines(tasks)
 
@@ -350,7 +351,7 @@ def task_add(
     """Add a task to a goal."""
 
     def render(config: Config, conn) -> None:
-        task = add_task(
+        task = add_job(
             conn,
             goal_id,
             title,
@@ -368,13 +369,13 @@ def task_add(
 
 @task_app.command("list")
 def task_list(
-    status: TaskStatus | None = typer.Option(None, "--status", "-s"),
+    status: JobStatus | None = typer.Option(None, "--status", "-s"),
     goal_id: int | None = typer.Option(None, "--goal", "-g"),
 ) -> None:
     """List tasks."""
 
     def render(_config: Config, conn) -> None:
-        tasks = list_tasks(conn, goal_id=goal_id, status=status)
+        tasks = list_jobs(conn, goal_id=goal_id, status=status)
         if not tasks:
             typer.echo("no tasks")
             return
@@ -393,7 +394,7 @@ def task_show(task_id: int = typer.Argument(help="Task id.")) -> None:
     """Show a task, its dependencies, and anything it blocks."""
 
     def render(_config: Config, conn) -> None:
-        task = require_task(conn, task_id)
+        task = require_job(conn, task_id)
         goal = require_goal(conn, task.goal_id)
         typer.echo(f"task #{task.id}")
         typer.echo(f"status      {task.status.value}")
@@ -438,7 +439,7 @@ def task_cancel(task_id: int = typer.Argument(help="Task id.")) -> None:
     """Cancel a task that is not already done."""
 
     def render(_config: Config, conn) -> None:
-        task = cancel_task(conn, task_id)
+        task = cancel_job(conn, task_id)
         typer.echo(f"cancelled #{task.id}  {task.title}")
 
     _with_db(render)
@@ -485,7 +486,7 @@ def _echo_goal(goal: Goal) -> None:
             typer.echo(f"- {item}")
 
 
-def _echo_task_lines(tasks: list[Task]) -> None:
+def _echo_task_lines(tasks: list[Job]) -> None:
     if not tasks:
         typer.echo("  (none)")
         return
@@ -495,8 +496,8 @@ def _echo_task_lines(tasks: list[Task]) -> None:
 
 def _format_event(event: Event) -> str:
     refs = []
-    if event.task_id is not None:
-        refs.append(f"task #{event.task_id}")
+    if event.job_id is not None:
+        refs.append(f"job #{event.job_id}")
     if event.run_id is not None:
         refs.append(f"run #{event.run_id}")
     prefix = f"{event.ts}  {event.kind}"
@@ -507,9 +508,9 @@ def _format_event(event: Event) -> str:
 
 
 def _format_task_ref(run: Run) -> str:
-    if run.task_id is None:
+    if run.job_id is None:
         return "(none)"
-    return f"#{run.task_id}"
+    return f"#{run.job_id}"
 
 
 def _format_exit(exit_code: int | None) -> str:
@@ -542,7 +543,7 @@ def _read_log_tail(log_path: str | None, *, lines: int = 40) -> str:
     return f"... {omitted} earlier lines\n" + "\n".join(parts[-lines:])
 
 
-def _format_related(tasks: list[Task]) -> str:
+def _format_related(tasks: list[Job]) -> str:
     if not tasks:
         return "(none)"
     return ", ".join(f"#{task.id} {task.title} [{task.status.value}]" for task in tasks)

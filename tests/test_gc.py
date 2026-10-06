@@ -11,8 +11,8 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.git import branch_exists, ensure_worktree
 from kiln.gc import cleanup
-from kiln.models import TaskStatus
-from kiln.tasks import add_goal, add_task, get_task, set_task_status, start_attempt
+from kiln.jobs import add_goal, add_job, get_job, set_integration, set_job_status, start_attempt
+from kiln.models import Integration, JobStatus
 from kiln.tick import run_tick
 
 runner = CliRunner()
@@ -36,21 +36,23 @@ def test_cleanup_drops_finished_worktrees_and_keeps_live_ones(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        done = _checkout(conn, factory, add_task(conn, goal.id, "Schema"), "kiln/1-schema")
-        review = _checkout(conn, factory, add_task(conn, goal.id, "CLI"), "kiln/2-cli")
-        failed = _checkout(conn, factory, add_task(conn, goal.id, "Docs"), "kiln/3-docs")
-        set_task_status(conn, done.id, TaskStatus.done)
-        set_task_status(conn, review.id, TaskStatus.review)
-        set_task_status(conn, failed.id, TaskStatus.failed)
+        done = _checkout(conn, factory, add_job(conn, goal.id, "Schema"), "kiln/1-schema")
+        review = _checkout(conn, factory, add_job(conn, goal.id, "CLI"), "kiln/2-cli")
+        failed = _checkout(conn, factory, add_job(conn, goal.id, "Docs"), "kiln/3-docs")
+        set_job_status(conn, done.id, JobStatus.completed)
+        set_integration(conn, done.id, Integration.merged)
+        set_job_status(conn, review.id, JobStatus.completed)
+        set_integration(conn, review.id, Integration.pending)
+        set_job_status(conn, failed.id, JobStatus.failed)
         leftover = factory / ".kiln" / "worktrees" / "99"
         leftover.mkdir(parents=True)
         (leftover / "junk.txt").write_text("x\n")
 
         lines = cleanup(conn, config)
         again = cleanup(conn, config)
-        done_row = get_task(conn, done.id)
-        review_row = get_task(conn, review.id)
-        failed_row = get_task(conn, failed.id)
+        done_row = get_job(conn, done.id)
+        review_row = get_job(conn, review.id)
+        failed_row = get_job(conn, failed.id)
     finally:
         conn.close()
 
@@ -81,12 +83,13 @@ def test_cleanup_keeps_a_merged_branch_when_configured(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = _checkout(conn, factory, add_task(conn, goal.id, "Schema"), "kiln/1-schema")
-        set_task_status(conn, task.id, TaskStatus.done)
+        task = _checkout(conn, factory, add_job(conn, goal.id, "Schema"), "kiln/1-schema")
+        set_job_status(conn, task.id, JobStatus.completed)
+        set_integration(conn, task.id, Integration.merged)
         preview = cleanup(conn, config, dry_run=True)
         assert (factory / ".kiln" / "worktrees" / "1").is_dir()
         lines = cleanup(conn, config)
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
@@ -106,9 +109,10 @@ def test_cleanup_leaves_a_worktree_outside_kiln(factory: Path, tmp_path: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Schema")
+        task = add_job(conn, goal.id, "Schema")
         start_attempt(conn, task.id, branch="kiln/1-schema", worktree_path=str(outside))
-        set_task_status(conn, task.id, TaskStatus.done)
+        set_job_status(conn, task.id, JobStatus.completed)
+        set_integration(conn, task.id, Integration.merged)
         lines = cleanup(conn, config)
     finally:
         conn.close()
@@ -125,8 +129,9 @@ def test_tick_cleans_before_the_foreman(factory: Path):
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     try:
         goal = add_goal(conn, "Ship it")
-        task = _checkout(conn, factory, add_task(conn, goal.id, "Schema"), "kiln/1-schema")
-        set_task_status(conn, task.id, TaskStatus.done)
+        task = _checkout(conn, factory, add_job(conn, goal.id, "Schema"), "kiln/1-schema")
+        set_job_status(conn, task.id, JobStatus.completed)
+        set_integration(conn, task.id, Integration.merged)
         dry = run_tick(conn, config, dry_run=True)
         assert (factory / ".kiln" / "worktrees" / "1").is_dir()
         result = run_tick(conn, config, agent_bin=str(script))
@@ -143,8 +148,9 @@ def test_cli_gc(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = _checkout(conn, factory, add_task(conn, goal.id, "Schema"), "kiln/1-schema")
-        set_task_status(conn, task.id, TaskStatus.done)
+        task = _checkout(conn, factory, add_job(conn, goal.id, "Schema"), "kiln/1-schema")
+        set_job_status(conn, task.id, JobStatus.completed)
+        set_integration(conn, task.id, Integration.merged)
     finally:
         conn.close()
 

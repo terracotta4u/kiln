@@ -15,7 +15,7 @@ from kiln.models import RunStatus
 from kiln.notes import list_notes
 from kiln.roles.scout import run_scout
 from kiln.runs import get_run
-from kiln.tasks import add_goal
+from kiln.jobs import add_goal
 
 runner = CliRunner()
 

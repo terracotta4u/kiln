@@ -11,9 +11,9 @@ from kiln.cli import app
 from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
-from kiln.models import RunStatus, TaskStatus
+from kiln.jobs import add_dependency, add_goal, add_job, get_job
+from kiln.models import JobStatus, RunStatus
 from kiln.roles.worker import run_worker
-from kiln.tasks import add_dependency, add_goal, add_task, get_task
 
 runner = CliRunner()
 
@@ -39,17 +39,17 @@ def test_worker_commits_on_a_branch_and_leaves_the_task_in_review(factory: Path,
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add hello", acceptance="file exists")
-        conn.execute("UPDATE tasks SET feedback = ? WHERE id = ?", ("try again", task.id))
+        task = add_job(conn, goal.id, "Add hello", acceptance="file exists")
+        conn.execute("UPDATE jobs SET feedback = ? WHERE id = ?", ("try again", task.id))
         outcome = run_worker(conn, config, agent_bin=str(script))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
     assert outcome.failure is None
     assert outcome.summary == "added hello"
     assert stored is not None
-    assert stored.status == TaskStatus.review
+    assert stored.status == JobStatus.completed
     assert stored.attempts == 1
     assert stored.branch == "kiln/1-add-hello"
     assert "hello.txt" in outcome.diffstat
@@ -83,14 +83,14 @@ def test_worker_keeps_a_commit_the_agent_already_made(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add hello")
+        task = add_job(conn, goal.id, "Add hello")
         outcome = run_worker(conn, config, task_id=task.id, agent_bin=str(script))
     finally:
         conn.close()
 
     assert outcome.failure is None
-    assert _subject(factory, outcome.task.branch or "") == "agent commit"
-    assert _commit_count(factory, outcome.task.branch or "") == 1
+    assert _subject(factory, outcome.job.branch or "") == "agent commit"
+    assert _commit_count(factory, outcome.job.branch or "") == 1
 
 
 def test_verify_failure_still_reaches_review(factory: Path):
@@ -100,12 +100,12 @@ def test_verify_failure_still_reaches_review(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add hello")
+        task = add_job(conn, goal.id, "Add hello")
         outcome = run_worker(conn, config, agent_bin=str(script))
     finally:
         conn.close()
 
-    assert outcome.task.status == TaskStatus.review
+    assert outcome.job.status == JobStatus.completed
     assert outcome.run.status == RunStatus.failed
     assert outcome.failure is not None
     assert "verify exited 3" in outcome.failure
@@ -124,14 +124,14 @@ def test_missing_report_still_commits(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "Add hello")
+        add_job(conn, goal.id, "Add hello")
         outcome = run_worker(conn, config, agent_bin=str(script))
     finally:
         conn.close()
 
     assert outcome.failure == "response had no JSON report"
-    assert outcome.task.status == TaskStatus.review
-    assert _commit_count(factory, outcome.task.branch or "") == 1
+    assert outcome.job.status == JobStatus.completed
+    assert _commit_count(factory, outcome.job.branch or "") == 1
 
 
 def test_exhausted_task_is_failed_and_the_next_ready_task_is_taken(factory: Path):
@@ -140,18 +140,18 @@ def test_exhausted_task_is_failed_and_the_next_ready_task_is_taken(factory: Path
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        high = add_task(conn, goal.id, "High", priority=10)
-        low = add_task(conn, goal.id, "Low", priority=1)
-        conn.execute("UPDATE tasks SET attempts = max_attempts WHERE id = ?", (high.id,))
+        high = add_job(conn, goal.id, "High", priority=10)
+        low = add_job(conn, goal.id, "Low", priority=1)
+        conn.execute("UPDATE jobs SET attempts = max_attempts WHERE id = ?", (high.id,))
         outcome = run_worker(conn, config, agent_bin=str(script))
-        failed = get_task(conn, high.id)
+        failed = get_job(conn, high.id)
     finally:
         conn.close()
 
     assert failed is not None
-    assert failed.status == TaskStatus.failed
-    assert outcome.task.id == low.id
-    assert outcome.task.status == TaskStatus.review
+    assert failed.status == JobStatus.failed
+    assert outcome.job.id == low.id
+    assert outcome.job.status == JobStatus.completed
 
 
 def test_only_exhausted_task_is_failed(factory: Path):
@@ -159,16 +159,16 @@ def test_only_exhausted_task_is_failed(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "High")
-        conn.execute("UPDATE tasks SET attempts = max_attempts WHERE id = ?", (task.id,))
+        task = add_job(conn, goal.id, "High")
+        conn.execute("UPDATE jobs SET attempts = max_attempts WHERE id = ?", (task.id,))
         with pytest.raises(KilnError, match="exhausted"):
             run_worker(conn, config, agent_bin=str(factory / "missing"))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
     assert stored is not None
-    assert stored.status == TaskStatus.failed
+    assert stored.status == JobStatus.failed
     assert not (factory / ".kiln" / "worktrees").exists()
 
 
@@ -177,17 +177,17 @@ def test_blocked_task_is_not_claimed(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        first = add_task(conn, goal.id, "First")
-        second = add_task(conn, goal.id, "Second")
+        first = add_job(conn, goal.id, "First")
+        second = add_job(conn, goal.id, "Second")
         add_dependency(conn, second.id, first.id)
         with pytest.raises(KilnError, match="not ready"):
             run_worker(conn, config, task_id=second.id, agent_bin=str(factory / "missing"))
-        stored = get_task(conn, second.id)
+        stored = get_job(conn, second.id)
     finally:
         conn.close()
 
     assert stored is not None
-    assert stored.status == TaskStatus.pending
+    assert stored.status == JobStatus.pending
 
 
 def test_missing_base_branch_releases_the_claim(factory: Path):
@@ -200,15 +200,15 @@ def test_missing_base_branch_releases_the_claim(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add hello")
+        task = add_job(conn, goal.id, "Add hello")
         with pytest.raises(KilnError):
             run_worker(conn, config, agent_bin=str(factory / "missing"))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
     assert stored is not None
-    assert stored.status == TaskStatus.pending
+    assert stored.status == JobStatus.pending
     assert stored.attempts == 0
     assert stored.claimed_by is None
 
@@ -220,7 +220,7 @@ def test_cli_work(factory: Path, monkeypatch: pytest.MonkeyPatch):
     assert runner.invoke(app, ["task", "add", "1", "Add hello"]).exit_code == 0
     result = runner.invoke(app, ["work"])
     assert result.exit_code == 0, result.output
-    assert "review" in result.output
+    assert "completed" in result.output
     assert "from the cli" in result.output
     assert "hello.txt" in result.output
     again = runner.invoke(app, ["work"])

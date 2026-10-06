@@ -11,14 +11,25 @@ class GoalStatus(StrEnum):
     done = "done"
 
 
-class TaskStatus(StrEnum):
+class JobRole(StrEnum):
+    scout = "scout"
+    worker = "worker"
+    reviewer = "reviewer"
+
+
+class JobStatus(StrEnum):
     pending = "pending"
     claimed = "claimed"
     running = "running"
-    review = "review"
-    done = "done"
+    completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
+
+
+class Integration(StrEnum):
+    pending = "pending"
+    merged = "merged"
+    rejected = "rejected"
 
 
 class RunStatus(StrEnum):
@@ -55,13 +66,18 @@ class Goal:
 
 
 @dataclass(frozen=True)
-class Task:
+class Job:
     id: int
     goal_id: int
+    role: JobRole
     title: str
     description: str
     acceptance: str
-    status: TaskStatus
+    question: str
+    focus: str
+    target_job_id: int | None
+    status: JobStatus
+    integration: Integration | None
     priority: int
     attempts: int
     max_attempts: int
@@ -69,18 +85,25 @@ class Task:
     worktree_path: str | None
     claimed_by: str | None
     feedback: str | None
+    result: str | None
     created_at: str
     updated_at: str
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
+    def from_row(cls, row: sqlite3.Row) -> "Job":
+        integration = row["integration"]
         return cls(
             id=row["id"],
             goal_id=row["goal_id"],
+            role=JobRole(row["role"]),
             title=row["title"],
             description=row["description"],
             acceptance=row["acceptance"],
-            status=TaskStatus(row["status"]),
+            question=row["question"],
+            focus=row["focus"],
+            target_job_id=row["target_job_id"],
+            status=JobStatus(row["status"]),
+            integration=Integration(integration) if integration else None,
             priority=row["priority"],
             attempts=row["attempts"],
             max_attempts=row["max_attempts"],
@@ -88,6 +111,7 @@ class Task:
             worktree_path=row["worktree_path"],
             claimed_by=row["claimed_by"],
             feedback=row["feedback"],
+            result=row["result"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -110,7 +134,7 @@ class Event:
     id: int
     ts: str
     kind: str
-    task_id: int | None
+    job_id: int | None
     run_id: int | None
     message: str
 
@@ -120,7 +144,7 @@ class Event:
             id=row["id"],
             ts=row["ts"],
             kind=row["kind"],
-            task_id=row["task_id"],
+            job_id=row["job_id"],
             run_id=row["run_id"],
             message=row["message"],
         )
@@ -146,7 +170,7 @@ class Note:
 @dataclass(frozen=True)
 class Run:
     id: int
-    task_id: int | None
+    job_id: int | None
     role: str
     model: str
     status: RunStatus
@@ -160,7 +184,7 @@ class Run:
     def from_row(cls, row: sqlite3.Row) -> "Run":
         return cls(
             id=row["id"],
-            task_id=row["task_id"],
+            job_id=row["job_id"],
             role=row["role"],
             model=row["model"],
             status=RunStatus(row["status"]),

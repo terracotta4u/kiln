@@ -11,11 +11,11 @@ from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
 from kiln.git import branch_diff, ensure_worktree
-from kiln.models import Run, RunStatus, Task, TaskStatus
+from kiln.jobs import require_goal, require_job
+from kiln.models import Integration, Job, JobRole, JobStatus, Run, RunStatus
 from kiln.prompts import render_prompt
 from kiln.publish import ensure_goal_branch
 from kiln.runs import finish_run, latest_run, start_run
-from kiln.tasks import require_goal, require_task
 
 DIFF_CHAR_LIMIT = 12_000
 _VERDICTS = {"approve", "needs_changes", "reject"}
@@ -23,7 +23,7 @@ _VERDICTS = {"approve", "needs_changes", "reject"}
 
 @dataclass(frozen=True)
 class ReviewOutcome:
-    task: Task
+    job: Job
     run: Run
     failure: str | None
     verdict: str | None
@@ -41,9 +41,15 @@ def run_reviewer(
     reporter: Callable[[str], None] | None = None,
 ) -> ReviewOutcome:
     """Review a task that is waiting in review. The task status stays put."""
-    task = require_task(conn, task_id)
-    if task.status != TaskStatus.review:
-        raise KilnError(f"task #{task_id} is {task.status.value}; only a task in review can be reviewed")
+    task = require_job(conn, task_id)
+    if not (
+        task.role == JobRole.worker
+        and task.status == JobStatus.completed
+        and task.integration == Integration.pending
+    ):
+        raise KilnError(
+            f"task #{task_id} is {task.status.value}; only a completed worker with pending integration can be reviewed"
+        )
     if not task.branch:
         raise KilnError(f"task #{task_id} has no branch to review")
     goal = require_goal(conn, task.goal_id)
@@ -51,7 +57,7 @@ def run_reviewer(
     worktree = Path(task.worktree_path) if task.worktree_path else config.worktrees_dir / str(task.id)
     ensure_worktree(config.repo_root, worktree, task.branch, integration)
 
-    run = start_run(conn, role="reviewer", model=config.models.reviewer, task_id=task.id)
+    run = start_run(conn, role="reviewer", model=config.models.reviewer, job_id=task.id)
     if reporter:
         reporter(f"reviewing task #{task.id} with {config.models.reviewer}")
     log_path = config.runs_dir / f"{run.id}.log"
@@ -92,7 +98,7 @@ def run_reviewer(
             log_path=None,
             report=None,
         )
-        record_event(conn, "review.failed", str(exc), task_id=task.id, run_id=finished.id)
+        record_event(conn, "review.failed", str(exc), job_id=task.id, run_id=finished.id)
         raise
 
     failure = _failure(result, timeout)
@@ -109,18 +115,18 @@ def run_reviewer(
         report=report if isinstance(report, dict) else None,
     )
     if failure:
-        record_event(conn, "review.failed", failure, task_id=task.id, run_id=finished.id)
-        return ReviewOutcome(task=require_task(conn, task.id), run=finished, failure=failure, verdict=None, summary="")
+        record_event(conn, "review.failed", failure, job_id=task.id, run_id=finished.id)
+        return ReviewOutcome(job=require_job(conn, task.id), run=finished, failure=failure, verdict=None, summary="")
     assert isinstance(report, dict)
     record_event(
         conn,
         "review.completed",
         f"{report['verdict']}: {report['summary']}",
-        task_id=task.id,
+        job_id=task.id,
         run_id=finished.id,
     )
     return ReviewOutcome(
-        task=require_task(conn, task.id),
+        job=require_job(conn, task.id),
         run=finished,
         failure=None,
         verdict=str(report["verdict"]),

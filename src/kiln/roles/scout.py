@@ -10,7 +10,7 @@ from kiln.models import Goal, GoalStatus, Note, Run, RunStatus
 from kiln.notes import add_note
 from kiln.prompts import render_prompt
 from kiln.runs import finish_run, start_run
-from kiln.tasks import list_goals, require_goal
+from kiln.jobs import list_goals, require_goal
 
 
 @dataclass(frozen=True)

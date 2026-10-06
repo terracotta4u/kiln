@@ -10,11 +10,11 @@ from typer.testing import CliRunner
 from kiln.cli import app
 from kiln.config import init_factory, load_config
 from kiln.db import connect
-from kiln.models import GoalStatus, TaskStatus
+from kiln.jobs import add_goal, add_job, get_job, list_jobs, require_goal
+from kiln.models import GoalStatus, Integration, JobStatus
 from kiln.notes import list_notes
-from kiln.roles.worker import run_worker
 from kiln.review import approve_task
-from kiln.tasks import add_goal, add_task, get_task, list_tasks, require_goal
+from kiln.roles.worker import run_worker
 from kiln.tick import run_tick, run_until_done
 
 runner = CliRunner()
@@ -40,23 +40,26 @@ def test_turns_dispatch_review_then_finish(factory: Path):
     try:
         add_goal(conn, "Ship it", "Add a marker file")
         first = run_tick(conn, config, agent_bin=str(script))
-        task = list_tasks(conn)[0]
+        task = list_jobs(conn)[0]
         on_main_after_work = (factory / "marker.txt").exists()
         second = run_tick(conn, config, agent_bin=str(script))
-        reviewed = get_task(conn, task.id)
+        reviewed = get_job(conn, task.id)
         third = run_tick(conn, config, agent_bin=str(script))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
         goal = require_goal(conn, 1)
     finally:
         conn.close()
 
     assert any("created task #1" in line for line in first.lines)
-    assert any("task #1  review" in line for line in first.lines)
-    assert task.status == TaskStatus.review
+    assert any("task #1  completed" in line for line in first.lines)
+    assert task.status == JobStatus.completed
+    assert task.integration == Integration.pending
     assert on_main_after_work is False
-    assert reviewed is not None and reviewed.status == TaskStatus.review
+    assert reviewed is not None and reviewed.status == JobStatus.completed
+    assert reviewed.integration == Integration.pending
     assert any("reviewed #1: approve" in line for line in second.lines)
-    assert stored is not None and stored.status == TaskStatus.done
+    assert stored is not None and stored.status == JobStatus.completed
+    assert stored.integration == Integration.merged
     assert not (factory / "marker.txt").exists()
     marker = subprocess.run(
         ["git", "show", "kiln/goal-1-ship-it:marker.txt"],
@@ -90,23 +93,21 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Edit readme")
+        task = add_job(conn, goal.id, "Edit readme")
         run_worker(conn, config, task_id=task.id, agent_bin=str(script))
-        from kiln.tasks import require_goal
-
         integration = require_goal(conn, goal.id).branch
         subprocess.run(["git", "checkout", integration], cwd=factory, check=True, capture_output=True)
         (factory / "README.md").write_text("goal\n")
         subprocess.run(["git", "commit", "-am", "goal edit"], cwd=factory, check=True, capture_output=True)
         subprocess.run(["git", "checkout", "main"], cwd=factory, check=True, capture_output=True)
         message = approve_task(conn, config, task.id)
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
     assert "rework" in message
     assert stored is not None
-    assert stored.status == TaskStatus.pending
+    assert stored.status == JobStatus.pending
     assert stored.feedback is not None and "conflicted" in stored.feedback
     assert (factory / "README.md").read_text() == "hello\n"
     goal_readme = subprocess.run(
@@ -129,7 +130,7 @@ def test_scout_action_runs_during_the_tick(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "Existing")
+        add_job(conn, goal.id, "Existing")
         first = run_tick(conn, config, agent_bin=str(script))
         notes_after_first = list_notes(conn, goal.id)
         second = run_tick(conn, config, agent_bin=str(script))
@@ -150,7 +151,7 @@ def test_dry_run_changes_nothing(factory: Path):
     try:
         add_goal(conn, "Ship it", "A factory")
         result = run_tick(conn, config, agent_bin=str(script), dry_run=True)
-        tasks = list_tasks(conn)
+        tasks = list_jobs(conn)
     finally:
         conn.close()
 
@@ -167,15 +168,15 @@ def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "First")
-        add_task(conn, goal.id, "Second")
+        add_job(conn, goal.id, "First")
+        add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=1, agent_bin=str(script))
-        tasks = list_tasks(conn)
+        tasks = list_jobs(conn)
     finally:
         conn.close()
 
     statuses = sorted(task.status for task in tasks)
-    assert statuses == [TaskStatus.pending, TaskStatus.review]
+    assert statuses == [JobStatus.completed, JobStatus.pending]
 
 
 def test_two_workers_run_together(factory: Path):
@@ -184,14 +185,14 @@ def test_two_workers_run_together(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        add_task(conn, goal.id, "First")
-        add_task(conn, goal.id, "Second")
+        add_job(conn, goal.id, "First")
+        add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=2, agent_bin=str(script))
-        tasks = list_tasks(conn)
+        tasks = list_jobs(conn)
     finally:
         conn.close()
 
-    assert [task.status for task in tasks] == [TaskStatus.review, TaskStatus.review]
+    assert [task.status for task in tasks] == [JobStatus.completed, JobStatus.completed]
 
 
 def test_run_until_done_opens_one_pull_request(factory: Path):
@@ -215,7 +216,7 @@ def test_run_until_done_opens_one_pull_request(factory: Path):
         add_goal(conn, "Ship it", "Add a marker file")
         result = run_until_done(conn, config, agent_bin=str(script), gh_bin=str(gh))
         goal = get_goal_row(conn)
-        from kiln.tasks import list_goals
+        from kiln.jobs import list_goals
 
         stored = list_goals(conn)[0]
     finally:
@@ -367,9 +368,9 @@ if "You are a scout" in prompt:
 elif "You are a Kiln reviewer" in prompt:
     {_emit_call('{"verdict": "approve", "summary": "marker is one line", "findings": ["file exists"], "confidence": 0.9}')}
 elif "You are the Kiln foreman" in prompt:
-    if "[review]" in prompt and "marker is one line" in prompt:
+    if "[completed]" in prompt and "integration pending" in prompt and "marker is one line" in prompt:
         {_emit_call('{"actions": [{"type": "approve", "task_id": 1}, {"type": "update_brief", "text": "Success: marker.txt exists."}, {"type": "goal_done", "evidence": ["marker.txt is ok on the goal branch"]}]}')}
-    elif "[review]" in prompt:
+    elif "[completed]" in prompt and "integration pending" in prompt:
         {_emit_call('{"actions": [{"type": "review", "task_id": 1, "focus": "marker.txt is one line"}]}')}
     elif "Tasks:\\n(none)" in prompt:
         {_emit_call('{"actions": [{"type": "create_task", "ref": "marker", "title": "Add marker", "description": "Write marker.txt", "acceptance": "file exists", "depends_on": [], "priority": 1}, {"type": "dispatch", "ref": "marker"}]}')}
@@ -437,6 +438,6 @@ def _agent(directory: Path, body: str) -> Path:
 
 
 def get_goal_row(conn):
-    from kiln.tasks import list_goals
+    from kiln.jobs import list_goals
 
     return list_goals(conn)[0].status

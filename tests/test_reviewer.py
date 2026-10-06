@@ -10,12 +10,12 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
 from kiln.git import commit_if_dirty, remove_worktree
-from kiln.models import RunStatus, TaskStatus
+from kiln.models import JobStatus, RunStatus
 from kiln.roles.foreman import goal_brief
 from kiln.roles.reviewer import DIFF_CHAR_LIMIT, run_reviewer
 from kiln.roles.worker import run_worker
 from kiln.runs import finish_run, start_run
-from kiln.tasks import add_goal, add_task, get_task, require_goal
+from kiln.jobs import add_goal, add_job, get_job, require_goal
 
 
 @pytest.fixture
@@ -38,18 +38,18 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it", "Add a marker")
-        task = add_task(conn, goal.id, "Add marker", acceptance="marker.txt exists")
+        task = add_job(conn, goal.id, "Add marker", acceptance="marker.txt exists")
         run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
-        reviewed = get_task(conn, task.id)
+        reviewed = get_job(conn, task.id)
         assert reviewed is not None and reviewed.worktree_path
         remove_worktree(factory, Path(reviewed.worktree_path))
 
         outcome = run_reviewer(conn, config, task.id, focus="check the marker", agent_bin=str(reviewer))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
         brief = goal_brief(conn, config, require_goal(conn, goal.id))
         log = Path(outcome.run.log_path or "").read_text()
 
-        later = start_run(conn, role="worker", model="worker", task_id=task.id)
+        later = start_run(conn, role="worker", model="worker", job_id=task.id)
         finish_run(
             conn,
             later.id,
@@ -65,7 +65,7 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
     assert outcome.failure is None
     assert outcome.verdict == "needs_changes"
     assert stored is not None
-    assert stored.status == TaskStatus.review
+    assert stored.status == JobStatus.completed
     assert (Path(stored.worktree_path or "") / "reviewer-was-here").is_file()
     assert not (factory / "reviewer-was-here").exists()
     command, _prompt = log.split("--- prompt ---", 1)
@@ -86,9 +86,9 @@ def test_reviewer_truncates_a_long_diff(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
+        task = add_job(conn, goal.id, "Add marker")
         run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
         assert stored is not None and stored.worktree_path
         worktree = Path(stored.worktree_path)
         (worktree / "big.txt").write_text("x" * (DIFF_CHAR_LIMIT + 5000))
@@ -107,8 +107,8 @@ def test_reviewer_rejects_a_task_that_is_not_in_review(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
-        with pytest.raises(KilnError, match="only a task in review"):
+        task = add_job(conn, goal.id, "Add marker")
+        with pytest.raises(KilnError, match="pending integration"):
             run_reviewer(conn, config, task.id, agent_bin=str(factory / "missing"))
     finally:
         conn.close()
@@ -121,16 +121,16 @@ def test_reviewer_records_a_bad_report_as_a_failure(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_task(conn, goal.id, "Add marker")
+        task = add_job(conn, goal.id, "Add marker")
         run_worker(conn, config, task_id=task.id, agent_bin=str(worker))
         outcome = run_reviewer(conn, config, task.id, agent_bin=str(reviewer))
-        stored = get_task(conn, task.id)
+        stored = get_job(conn, task.id)
     finally:
         conn.close()
 
     assert outcome.failure == "response had no JSON report"
     assert outcome.run.status == RunStatus.failed
-    assert stored is not None and stored.status == TaskStatus.review
+    assert stored is not None and stored.status == JobStatus.completed
 
 
 def _worker_script() -> str:

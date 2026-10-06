@@ -10,7 +10,23 @@ from kiln.config import Config
 from kiln.db import connect, migrate, record_event
 from kiln.errors import KilnError
 from kiln.git import diffstat, goal_branch_name
-from kiln.models import Goal, GoalStatus, Run, RunStatus, Task, TaskStatus
+from kiln.jobs import (
+    add_dependency,
+    add_job,
+    cancel_job,
+    dependencies,
+    dependency_satisfied,
+    fail_job,
+    is_open,
+    list_jobs,
+    ready_jobs,
+    require_goal,
+    require_job,
+    set_goal_brief,
+    set_goal_evidence,
+    set_goal_status,
+)
+from kiln.models import Goal, GoalStatus, Integration, Job, JobStatus, Run, RunStatus
 from kiln.notes import add_note, list_notes
 from kiln.prompts import render_prompt
 from kiln.review import approve_task, reject_task, send_back
@@ -18,22 +34,7 @@ from kiln.roles.reviewer import run_reviewer
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
 from kiln.runs import finish_run, latest_run, start_run
-from kiln.tasks import (
-    add_dependency,
-    add_task,
-    cancel_task,
-    dependencies,
-    fail_task,
-    list_tasks,
-    ready_tasks,
-    require_goal,
-    require_task,
-    set_goal_brief,
-    set_goal_evidence,
-    set_goal_status,
-)
 
-_OPEN = {TaskStatus.pending, TaskStatus.claimed, TaskStatus.running, TaskStatus.review}
 _AGENT_TYPES = frozenset({"scout", "dispatch", "review"})
 _DECISIONS = frozenset({"approve", "rework", "fail"})
 _NOTE_LIMIT = 2000
@@ -74,21 +75,26 @@ def goal_brief(
             "Tasks:",
         ]
     )
-    tasks = list_tasks(conn, goal_id=goal.id)
-    ready_ids = {task.id for task in ready_tasks(conn, goal_id=goal.id)}
+    tasks = list_jobs(conn, goal_id=goal.id)
+    ready_ids = {task.id for task in ready_jobs(conn, goal_id=goal.id)}
     if not tasks:
         lines.append("(none)")
     for task in tasks:
         deps = dependencies(conn, task.id)
         dep_text = ", ".join(f"#{dep.id} {dep.title}" for dep in deps) or "-"
         availability = _availability(task, deps, ready_ids)
+        integration = f"integration {task.integration.value} " if task.integration else ""
         lines.append(
-            f"- #{task.id} [{task.status.value}] {availability}p{task.priority} "
+            f"- #{task.id} [{task.status.value}] {integration}{availability}p{task.priority} "
             f"attempts {task.attempts}/{task.max_attempts} deps {dep_text}: {task.title}"
         )
         if task.feedback:
             lines.append(f"  feedback: {task.feedback}")
-        if task.status == TaskStatus.review:
+        if (
+            task.role.value == "worker"
+            and task.status == JobStatus.completed
+            and task.integration == Integration.pending
+        ):
             lines.extend(_review_lines(conn, config, goal, task))
     lines.append("")
     lines.append("Notes:")
@@ -194,7 +200,7 @@ def apply_actions(
     and only when an action asks for them.
     """
     refs: dict[str, int] = {}
-    for task in list_tasks(conn, goal_id=goal.id):
+    for task in list_jobs(conn, goal_id=goal.id):
         refs.setdefault(task.title, task.id)
     limit = config.max_parallel_workers if worker_limit is None else worker_limit
     indexed = list(enumerate(actions, start=1))
@@ -431,10 +437,10 @@ def _apply_one(
     if kind == "fail":
         task_id = _in_goal(conn, goal, _task_id(action))
         reason = _optional_text(action, "reason") or "failed by foreman"
-        fail_task(conn, task_id, reason)
+        fail_job(conn, task_id, reason)
         return f"task #{task_id} failed"
     if kind == "cancel":
-        task = cancel_task(conn, _in_goal(conn, goal, _task_id(action)))
+        task = cancel_job(conn, _in_goal(conn, goal, _task_id(action)))
         return f"cancelled #{task.id} {task.title}"
     if kind == "note":
         note = add_note(conn, goal.id, _text(action, "text"))
@@ -452,7 +458,7 @@ def _create_task(
     refs: dict[str, int],
 ) -> str:
     title = _text(action, "title")
-    task = add_task(
+    task = add_job(
         conn,
         goal.id,
         title,
@@ -517,14 +523,14 @@ def _dispatch(
     reporter: Callable[[str], None] | None,
 ) -> str:
     task_id = _resolve_task_ref(conn, goal, action, refs)
-    task = require_task(conn, task_id)
-    if task.status != TaskStatus.pending:
+    task = require_job(conn, task_id)
+    if task.status != JobStatus.pending:
         raise KilnError(f"task #{task_id} is {task.status.value}; only a pending task can be dispatched")
-    if task.id not in {ready.id for ready in ready_tasks(conn, goal_id=goal.id)}:
+    if task.id not in {ready.id for ready in ready_jobs(conn, goal_id=goal.id)}:
         raise KilnError(f"task #{task_id} is blocked")
     outcome = run_worker(conn, config, task_id=task_id, agent_bin=agent_bin, reporter=reporter)
-    branch = outcome.task.branch or ""
-    line = f"task #{outcome.task.id}  {outcome.task.status.value}  {branch}"
+    branch = outcome.job.branch or ""
+    line = f"task #{outcome.job.id}  {outcome.job.status.value}  {branch}"
     if outcome.failure:
         return f"{line}: {outcome.failure}"
     return line
@@ -555,7 +561,7 @@ def _review(
 
 
 def _finish_goal(conn: sqlite3.Connection, goal: Goal, action: dict) -> str:
-    open_tasks = [task for task in list_tasks(conn, goal_id=goal.id) if task.status in _OPEN]
+    open_tasks = [task for task in list_jobs(conn, goal_id=goal.id) if is_open(task)]
     if open_tasks:
         ids = ", ".join(f"#{task.id}" for task in open_tasks)
         raise KilnError(f"goal #{goal.id} still has open tasks: {ids}")
@@ -576,12 +582,12 @@ def _resolve_task_ref(conn: sqlite3.Connection, goal: Goal, action: dict, refs: 
     raise KilnError("action needs a task_id or ref")
 
 
-def _availability(task: Task, deps: list[Task], ready_ids: set[int]) -> str:
-    if task.status != TaskStatus.pending:
+def _availability(task: Job, deps: list[Job], ready_ids: set[int]) -> str:
+    if task.status != JobStatus.pending:
         return ""
     if task.id in ready_ids:
         return "ready "
-    waiting = [dep.id for dep in deps if dep.status != TaskStatus.done]
+    waiting = [dep.id for dep in deps if not dependency_satisfied(dep, for_role=task.role)]
     if not waiting:
         return "blocked "
     return "blocked by " + ", ".join(f"#{dep_id}" for dep_id in waiting) + " "
@@ -601,7 +607,7 @@ def _resolve_dep(conn: sqlite3.Connection, goal_id: int, dep: object, refs: dict
         return _task_in_goal(conn, goal_id, int(text))
     if text in refs:
         return _task_in_goal(conn, goal_id, refs[text])
-    matches = [task for task in list_tasks(conn, goal_id=goal_id) if task.title == text]
+    matches = [task for task in list_jobs(conn, goal_id=goal_id) if task.title == text]
     if len(matches) == 1:
         return matches[0].id
     if len(matches) > 1:
@@ -614,13 +620,13 @@ def _in_goal(conn: sqlite3.Connection, goal: Goal, task_id: int) -> int:
 
 
 def _task_in_goal(conn: sqlite3.Connection, goal_id: int, task_id: int) -> int:
-    task = require_task(conn, task_id)
+    task = require_job(conn, task_id)
     if task.goal_id != goal_id:
         raise KilnError(f"task #{task_id} is not in goal #{goal_id}")
     return task.id
 
 
-def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Task) -> list[str]:
+def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Job) -> list[str]:
     lines: list[str] = []
     if task.branch:
         try:

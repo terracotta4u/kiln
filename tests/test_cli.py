@@ -124,11 +124,11 @@ def test_log_and_runs_show(repo):
     assert runner.invoke(app, ["task", "add", "1", "Schema"]).exit_code == 0
     logged = runner.invoke(app, ["log"])
     assert logged.exit_code == 0, logged.output
-    assert logged.output.index("goal.created") < logged.output.index("task.created")
-    assert "task #1" in logged.output
+    assert logged.output.index("goal.created") < logged.output.index("job.created")
+    assert "job #1" in logged.output
 
     latest = runner.invoke(app, ["log", "-n", "1"])
-    assert "task.created" in latest.output
+    assert "job.created" in latest.output
     assert "goal.created" not in latest.output
 
     rejected = runner.invoke(app, ["log", "-n", "0"])
@@ -175,7 +175,7 @@ def test_goal_show_prints_brief_and_evidence(repo):
     assert runner.invoke(app, ["init"]).exit_code == 0
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
     from kiln.db import connect
-    from kiln.tasks import set_goal_brief, set_goal_evidence
+    from kiln.jobs import set_goal_brief, set_goal_evidence
 
     config = load_config(repo)
     conn = connect(config.db_path)

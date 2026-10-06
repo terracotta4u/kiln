@@ -4,9 +4,9 @@ from pathlib import Path
 from kiln.config import Config
 from kiln.errors import KilnError
 from kiln.git import delete_branch, merge_branch, remove_worktree
-from kiln.models import TaskStatus
+from kiln.jobs import fail_job, require_goal, require_job, rework_job, set_integration
+from kiln.models import Integration, JobRole, JobStatus
 from kiln.publish import ensure_goal_branch
-from kiln.tasks import fail_task, require_goal, require_task, rework_task, set_task_status
 
 
 def approve_task(conn: sqlite3.Connection, config: Config, task_id: int) -> str:
@@ -18,13 +18,13 @@ def approve_task(conn: sqlite3.Connection, config: Config, task_id: int) -> str:
     _remove_worktree(config, task.worktree_path)
     result = merge_branch(config.repo_root, task.branch, integration)
     if not result.merged:
-        rework_task(
+        rework_job(
             conn,
             task_id,
             f"Merge into {integration} conflicted.\n{result.message}",
         )
         return f"task #{task_id} conflicted and was sent back for rework"
-    set_task_status(conn, task_id, TaskStatus.done)
+    set_integration(conn, task_id, Integration.merged)
     if config.delete_merged_branches:
         try:
             delete_branch(config.repo_root, task.branch)
@@ -34,22 +34,27 @@ def approve_task(conn: sqlite3.Connection, config: Config, task_id: int) -> str:
 
 
 def send_back(conn: sqlite3.Connection, task_id: int, feedback: str) -> str:
-    task = rework_task(conn, task_id, feedback)
-    if task.status == TaskStatus.failed:
-        return f"task #{task_id} exhausted its attempts and failed"
+    rework_job(conn, task_id, feedback)
     return f"task #{task_id} sent back for rework"
 
 
 def reject_task(conn: sqlite3.Connection, task_id: int, reason: str) -> str:
+    """Foreman fail still marks execution failed. Integration reject arrives with the action rename."""
     _require_review(conn, task_id)
-    fail_task(conn, task_id, reason.strip() or "failed")
+    fail_job(conn, task_id, reason.strip() or "failed")
     return f"task #{task_id} failed"
 
 
 def _require_review(conn: sqlite3.Connection, task_id: int):
-    task = require_task(conn, task_id)
-    if task.status != TaskStatus.review:
-        raise KilnError(f"task #{task_id} is {task.status.value}; only a task in review can be reviewed")
+    task = require_job(conn, task_id)
+    if not (
+        task.role == JobRole.worker
+        and task.status == JobStatus.completed
+        and task.integration == Integration.pending
+    ):
+        raise KilnError(
+            f"task #{task_id} is {task.status.value}; only a completed worker with pending integration can be reviewed"
+        )
     return task
 
 
