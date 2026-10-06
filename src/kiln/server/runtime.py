@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiln.agent import kill_live_agents
+from kiln.agent import shutdown_agents
 from kiln.config import load_config
 from kiln.db import connect, last_event_id, migrate, record_event, utc_now
 from kiln.errors import KilnError
@@ -122,7 +122,7 @@ class FactoryRuntime:
             running = [factory for factory in self._factories.values() if factory.state == RUNNING]
         for factory in running:
             factory.stop_event.set()
-        kill_live_agents()
+        shutdown_agents()
         deadline = time.monotonic() + timeout
         for factory in running:
             thread = factory.thread

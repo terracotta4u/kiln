@@ -24,6 +24,7 @@ DEFAULT_TIMEOUT_SECONDS = 600
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _LIVE: set[subprocess.Popen[str]] = set()
 _LIVE_LOCK = threading.Lock()
+_SHUTTING_DOWN = False
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,21 @@ def default_agent_bin() -> str:
 def kill_live_agents() -> None:
     """Kill every agent process this interpreter still has running."""
     with _LIVE_LOCK:
+        processes = list(_LIVE)
+    for process in processes:
+        _kill(process)
+
+
+def shutdown_agents() -> None:
+    """Refuse new agents, then kill the ones already running.
+
+    The shutdown flag and the snapshot of live processes are taken under the
+    same lock that run_agent holds across Popen and registration, so a spawn
+    cannot land in the gap and outlive the server.
+    """
+    global _SHUTTING_DOWN
+    with _LIVE_LOCK:
+        _SHUTTING_DOWN = True
         processes = list(_LIVE)
     for process in processes:
         _kill(process)
@@ -124,21 +140,22 @@ def run_agent(
         agent_bin=agent_bin,
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
-    except FileNotFoundError as exc:
-        raise KilnError(f"agent executable not found: {command[0]}") from exc
-
     with _LIVE_LOCK:
+        if _SHUTTING_DOWN:
+            raise KilnError("server is shutting down")
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise KilnError(f"agent executable not found: {command[0]}") from exc
         _LIVE.add(process)
     try:
         stdout = _capture(process, command, prompt, log_path, timeout)
