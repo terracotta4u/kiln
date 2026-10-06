@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from kiln.cli import app
+from kiln.cli import _follow, app
 from kiln.config import init_factory, load_config
-from kiln.db import connect, events_after
+from kiln.db import connect, events_after, record_event
 from kiln.jobs import add_goal
 from kiln.models import GoalStatus
 from kiln.notes import list_notes
@@ -225,6 +225,25 @@ def test_a_stopped_run_does_not_start_another_pass_for_a_new_goal(
     assert calls["n"] == 1
     assert running.state == "stopped"
     assert running.stop_reason == "turn_limit"
+
+
+def test_a_follower_reads_events_past_the_first_page(factory: Path, capsys: pytest.CaptureFixture[str]):
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        for index in range(120):
+            record_event(conn, "runtime", f"padded {index}")
+    finally:
+        conn.close()
+    client = ensure_running()
+    assert client.start_factory(factory, turns=1)["started"] is True
+    _wait_factory(factory, lambda factory_state: factory_state["state"] == "completed")
+
+    _follow(client, factory, 0)
+    output = capsys.readouterr().out
+    assert "padded 0" in output
+    assert "padded 119" in output
+    assert "factory completed" in output
 
 
 def test_attach_shows_the_factory_another_client_started(factory: Path):

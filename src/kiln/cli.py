@@ -660,20 +660,29 @@ def _server_line(repo: Path) -> str:
     return "server  running, idle"
 
 
+_FOLLOW_PAGE = 100
+
+
 def _follow(client: Client, repo: Path, cursor: int) -> None:
     while True:
-        page = client.events(repo, after=cursor, limit=100)
-        for raw in page["events"]:
+        page = client.events(repo, after=cursor, limit=_FOLLOW_PAGE)
+        events = page["events"]
+        for raw in events:
             event = _event_from_payload(raw)
             typer.echo(_format_event(event))
             cursor = event.id
         factory = page["factory"]
-        if factory["state"] != "running":
-            _echo_outcome(factory)
-            if factory["state"] == "failed":
-                raise typer.Exit(code=1)
-            return
-        time.sleep(0.5)
+        if factory["state"] == "running":
+            time.sleep(0.5)
+            continue
+        # A finished factory can still have more events than one page. Keep
+        # reading until a short page, which means the cursor has caught the tail.
+        if len(events) >= _FOLLOW_PAGE:
+            continue
+        _echo_outcome(factory)
+        if factory["state"] == "failed":
+            raise typer.Exit(code=1)
+        return
 
 
 def _print_factory_view(config: Config, info: dict, since: int | None) -> int:
