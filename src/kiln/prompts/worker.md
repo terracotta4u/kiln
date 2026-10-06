@@ -5,7 +5,7 @@ Branch: {{branch}}
 Goal branch: {{integration_branch}}
 Pull request target: {{base_branch}}
 Goal #{{goal_id}}: {{goal_title}}
-Task #{{task_id}}: {{title}}
+Job #{{task_id}}: {{title}}
 
 Description:
 {{description}}

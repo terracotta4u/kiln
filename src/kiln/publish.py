@@ -152,9 +152,9 @@ def _pull_request_body(conn: sqlite3.Connection, goal: Goal) -> str:
         lines.extend(f"- {item}" for item in goal.evidence)
     else:
         lines.append("(none)")
-    lines.extend(["", "Tasks:"])
+    lines.extend(["", "Jobs:"])
     for task in list_jobs(conn, goal_id=goal.id):
-        lines.append(f"- #{task.id} [{task.status.value}] {task.title}")
+        lines.append(f"- #{task.id} {task.role.value} [{task.status.value}] {task.title}")
     return "\n".join(lines).strip() + "\n"
 
 

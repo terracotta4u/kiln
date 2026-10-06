@@ -9,18 +9,18 @@ from kiln.agent import DEFAULT_TIMEOUT_SECONDS, run_agent
 from kiln.config import Config
 from kiln.db import connect, migrate, record_event
 from kiln.errors import KilnError
-from kiln.git import diffstat, goal_branch_name
+from kiln.git import goal_branch_name
 from kiln.jobs import (
     add_dependency,
     add_job,
     cancel_job,
     dependencies,
     dependency_satisfied,
-    fail_job,
+    get_job,
     is_open,
-    jobs_targeting,
     list_jobs,
     ready_jobs,
+    reject_job,
     require_goal,
     require_job,
     set_goal_brief,
@@ -30,15 +30,15 @@ from kiln.jobs import (
 from kiln.models import Goal, GoalStatus, Integration, Job, JobRole, JobStatus, Run, RunStatus
 from kiln.notes import add_note, list_notes
 from kiln.prompts import render_prompt
-from kiln.review import approve_task, reject_task, send_back
+from kiln.review import approve_task, send_back
 from kiln.roles.reviewer import run_reviewer
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
 from kiln.result import role_result
-from kiln.runs import finish_run, latest_run, start_run
+from kiln.runs import finish_run, start_run
 
-_AGENT_TYPES = frozenset({"scout", "dispatch", "review"})
-_DECISIONS = frozenset({"approve", "rework", "fail"})
+_AGENT_TYPES = frozenset({"dispatch"})
+_DECISIONS = frozenset({"approve", "reject"})
 _NOTE_LIMIT = 2000
 
 
@@ -74,7 +74,7 @@ def goal_brief(
         [
             f"Workers this turn: {limit}",
             "",
-            "Tasks:",
+            "Jobs:",
         ]
     )
     tasks = list_jobs(conn, goal_id=goal.id)
@@ -86,21 +86,19 @@ def goal_brief(
         dep_text = ", ".join(f"#{dep.id} {dep.title}" for dep in deps) or "-"
         availability = _availability(task, deps, ready_ids)
         integration = f"integration {task.integration.value} " if task.integration else ""
+        target = f" target #{task.target_job_id}" if task.target_job_id else ""
         lines.append(
-            f"- #{task.id} [{task.status.value}] {integration}{availability}p{task.priority} "
-            f"attempts {task.attempts}/{task.max_attempts} deps {dep_text}: {task.title}"
+            f"- #{task.id} [{task.status.value}] {integration}{availability}{task.role.value} "
+            f"p{task.priority} attempts {task.attempts}/{task.max_attempts} "
+            f"deps {dep_text}{target}: {task.title}"
         )
+        if task.question:
+            lines.append(f"  question: {task.question}")
+        if task.focus:
+            lines.append(f"  focus: {task.focus}")
         if task.feedback:
             lines.append(f"  feedback: {task.feedback}")
-        summary = _result_summary(task.result)
-        if summary:
-            lines.append(f"  result: {summary}")
-        if (
-            task.role.value == "worker"
-            and task.status == JobStatus.completed
-            and task.integration == Integration.pending
-        ):
-            lines.extend(_review_lines(conn, config, goal, task))
+        lines.extend(_result_lines(task.result))
     lines.append("")
     lines.append("Notes:")
     notes = list_notes(conn, goal.id)
@@ -201,19 +199,19 @@ def apply_actions(
 ) -> AppliedActions:
     """Apply foreman decisions. One bad action does not discard the rest.
 
-    State changes run first. Scout, dispatch, and review then run together,
-    and only when an action asks for them.
+    State changes run first. Dispatches then run together, and only when an action asks for them.
     """
     refs: dict[str, int] = {}
     for task in list_jobs(conn, goal_id=goal.id):
         refs.setdefault(task.title, task.id)
     limit = config.max_parallel_workers if worker_limit is None else worker_limit
     indexed = list(enumerate(actions, start=1))
-    conflicts = _same_turn_conflicts(actions, refs)
+    created = _jobs_created_in_list(actions)
+    conflicts = _same_turn_conflicts(conn, actions, created, refs)
     messages: dict[int, str] = {}
     agents: list[tuple[int, dict]] = []
     for index, action in indexed:
-        refusal = _same_turn_refusal(action, refs, conflicts)
+        refusal = _same_turn_refusal(action, created, refs, conflicts, conn)
         if refusal:
             messages[index] = _record_action(conn, f"action {index} failed: {refusal}")
             continue
@@ -251,52 +249,137 @@ def _is_agent(action: object) -> bool:
     return isinstance(action, dict) and action.get("type") in _AGENT_TYPES
 
 
-def _same_turn_conflicts(actions: list[dict], refs: dict[str, int]) -> set[object]:
-    """Tasks that this list both reviews and approves, reworks, or fails.
+def _same_turn_conflicts(
+    conn: sqlite3.Connection,
+    actions: list[dict],
+    created: dict[str, tuple[str, object | None]],
+    refs: dict[str, int],
+) -> set[object]:
+    """Worker jobs this list both sends a reviewer after and approves or rejects.
 
-    Those decisions run before the reviewer, so the verdict cannot inform them.
+    Approve and reject run before dispatch, so that reviewer's verdict cannot inform them.
+    Rework stays out of the guard: it keeps the worktree for another attempt.
     """
-    reviewed: set[object] = set()
+    targets: set[object] = set()
     decided: set[object] = set()
     for action in actions:
         if not isinstance(action, dict):
             continue
-        key = _task_key(action, refs)
-        if key is None:
-            continue
         kind = action.get("type")
-        if kind == "review":
-            reviewed.add(key)
+        if kind == "dispatch":
+            target = _dispatched_review_target(conn, action, created, refs)
+            if target is not None:
+                targets.add(target)
         elif kind in _DECISIONS:
-            decided.add(key)
-    return reviewed & decided
+            key = _decision_key(action, created, refs)
+            if key is not None:
+                decided.add(key)
+    return targets & decided
 
 
-def _task_key(action: dict, refs: dict[str, int]) -> object | None:
-    if "task_id" in action and action.get("task_id") is not None:
-        value = action["task_id"]
+def _jobs_created_in_list(actions: list[dict]) -> dict[str, tuple[str, object | None]]:
+    """Map each create_job ref to its role and, for a reviewer, the target key."""
+    named: list[tuple[str, dict]] = []
+    for action in actions:
+        if not isinstance(action, dict) or action.get("type") != "create_job":
+            continue
+        ref = action.get("ref")
+        if isinstance(ref, str) and ref.strip():
+            named.append((ref.strip(), action))
+    created: dict[str, tuple[str, object | None]] = {}
+    for name, action in named:
+        role = action.get("role")
+        role_name = role.strip() if isinstance(role, str) else ""
+        target = _target_key(action.get("target_job_id")) if role_name == "reviewer" else None
+        created[name] = (role_name, target)
+    return created
+
+
+def _target_key(value: object) -> object | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.startswith("#") and text[1:].isdigit():
+        return int(text[1:])
+    if text.isdigit():
+        return int(text)
+    return ("ref", text)
+
+
+def _dispatched_review_target(
+    conn: sqlite3.Connection,
+    action: dict,
+    created: dict[str, tuple[str, object | None]],
+    refs: dict[str, int],
+) -> object | None:
+    if "job_id" in action and action.get("job_id") is not None:
+        value = action.get("job_id")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        job = get_job(conn, value)
+        if job is not None and job.role == JobRole.reviewer and job.target_job_id is not None:
+            return job.target_job_id
+        return None
+    ref = action.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    name = ref.strip()
+    if name in created:
+        role, target = created[name]
+        if role == "reviewer":
+            return target
+        return None
+    if name in refs:
+        job = get_job(conn, refs[name])
+        if job is not None and job.role == JobRole.reviewer and job.target_job_id is not None:
+            return job.target_job_id
+    return None
+
+
+def _decision_key(
+    action: dict,
+    created: dict[str, tuple[str, object | None]],
+    refs: dict[str, int],
+) -> object | None:
+    if "job_id" in action and action.get("job_id") is not None:
+        value = action.get("job_id")
         if isinstance(value, bool) or not isinstance(value, int):
             return None
         return value
     ref = action.get("ref")
-    if isinstance(ref, str) and ref.strip():
-        name = ref.strip()
-        if name in refs:
-            return refs[name]
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    name = ref.strip()
+    if name in created:
         return ("ref", name)
-    return None
+    if name in refs:
+        return refs[name]
+    return ("ref", name)
 
 
-def _same_turn_refusal(action: object, refs: dict[str, int], conflicts: set[object]) -> str | None:
+def _same_turn_refusal(
+    action: object,
+    created: dict[str, tuple[str, object | None]],
+    refs: dict[str, int],
+    conflicts: set[object],
+    conn: sqlite3.Connection,
+) -> str | None:
     if not isinstance(action, dict):
         return None
-    if action.get("type") not in {"review", *_DECISIONS}:
+    kind = action.get("type")
+    key: object | None = None
+    if kind == "dispatch":
+        key = _dispatched_review_target(conn, action, created, refs)
+    elif kind in _DECISIONS:
+        key = _decision_key(action, created, refs)
+    if key is None or key not in conflicts:
         return None
-    key = _task_key(action, refs)
-    if key not in conflicts:
-        return None
-    label = f"#{key}" if isinstance(key, int) else repr(key[1])
-    return f"cannot review and approve, rework, or fail task {label} in one turn"
+    label = f"#{key}" if isinstance(key, int) else key[1]
+    return f"cannot dispatch a reviewer and approve or reject job {label} in one turn"
 
 
 def _attempt(
@@ -424,28 +507,24 @@ def _apply_one(
     if not isinstance(action, dict):
         raise KilnError("action is not an object")
     kind = action.get("type")
-    if kind == "create_task":
-        return _create_task(conn, config, goal, action, refs)
-    if kind == "scout":
-        return _scout(conn, config, goal, action, agent_bin=agent_bin, reporter=reporter)
+    if kind == "create_job":
+        return _create_job(conn, config, goal, action, refs)
     if kind == "dispatch":
         return _dispatch(conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter)
-    if kind == "review":
-        return _review(conn, config, goal, action, refs, agent_bin=agent_bin, reporter=reporter)
     if kind == "update_brief":
         updated = set_goal_brief(conn, goal.id, _text(action, "text"))
         return f"updated brief for goal #{updated.id}"
     if kind == "approve":
-        return approve_task(conn, config, _in_goal(conn, goal, _task_id(action)))
+        return approve_task(conn, config, _in_goal(conn, goal, _resolve_job_ref(conn, goal, action, refs)))
+    if kind == "reject":
+        job_id = _in_goal(conn, goal, _resolve_job_ref(conn, goal, action, refs))
+        reason = _optional_text(action, "reason") or "rejected"
+        reject_job(conn, job_id, reason)
+        return f"job #{job_id} rejected"
     if kind == "rework":
-        return send_back(conn, _in_goal(conn, goal, _task_id(action)), _text(action, "feedback"))
-    if kind == "fail":
-        task_id = _in_goal(conn, goal, _task_id(action))
-        reason = _optional_text(action, "reason") or "failed by foreman"
-        fail_job(conn, task_id, reason)
-        return f"task #{task_id} failed"
+        return send_back(conn, _in_goal(conn, goal, _resolve_job_ref(conn, goal, action, refs)), _text(action, "feedback"))
     if kind == "cancel":
-        task = cancel_job(conn, _in_goal(conn, goal, _task_id(action)))
+        task = cancel_job(conn, _in_goal(conn, goal, _resolve_job_ref(conn, goal, action, refs)))
         return f"cancelled #{task.id} {task.title}"
     if kind == "note":
         note = add_note(conn, goal.id, _text(action, "text"))
@@ -455,66 +534,84 @@ def _apply_one(
     raise KilnError(f"unknown action type {kind!r}")
 
 
-def _create_task(
+def _create_job(
     conn: sqlite3.Connection,
     config: Config,
     goal: Goal,
     action: dict,
     refs: dict[str, int],
 ) -> str:
+    role = _role(action)
     title = _text(action, "title")
-    task = add_job(
-        conn,
-        goal.id,
-        title,
-        description=_optional_text(action, "description"),
-        acceptance=_optional_text(action, "acceptance"),
-        priority=_priority(action),
-        max_attempts=config.max_attempts,
-    )
-    ref = action.get("ref")
-    if isinstance(ref, str) and ref.strip():
-        refs[ref.strip()] = task.id
-    refs.setdefault(task.title, task.id)
+    question = ""
+    focus = ""
+    acceptance = ""
+    target_id: int | None = None
     depends_on = action.get("depends_on") or []
     if not isinstance(depends_on, list):
         raise KilnError("depends_on must be a list")
+    if role == JobRole.scout:
+        question = _text(action, "question")
+    elif role == JobRole.worker:
+        acceptance = _optional_text(action, "acceptance")
+    else:
+        focus = _optional_text(action, "focus")
+        if "target_job_id" not in action or action.get("target_job_id") is None:
+            raise KilnError("reviewer job requires a target_job_id")
+        target_id = _resolve_dep(conn, goal.id, action.get("target_job_id"), refs)
+    description = _optional_text(action, "description")
+    if role == JobRole.reviewer:
+        linked = [_resolve_dep(conn, goal.id, dep, refs) for dep in depends_on]
+        if target_id not in linked:
+            raise KilnError("reviewer target must be listed in depends_on")
+        job = add_job(
+            conn,
+            goal.id,
+            title,
+            role=role,
+            description=description,
+            focus=focus,
+            target_job_id=target_id,
+            depends_on=linked,
+            priority=_priority(action),
+            max_attempts=config.max_attempts,
+        )
+        _remember(refs, action, job.id, job.title)
+        deps = ", ".join(f"#{dep_id}" for dep_id in linked)
+        return f"created job #{job.id} {job.title} depending on {deps}"
+    job = add_job(
+        conn,
+        goal.id,
+        title,
+        role=role,
+        description=description,
+        acceptance=acceptance,
+        question=question,
+        priority=_priority(action),
+        max_attempts=config.max_attempts,
+    )
+    _remember(refs, action, job.id, job.title)
     linked: list[int] = []
     for dep in depends_on:
         try:
             dep_id = _resolve_dep(conn, goal.id, dep, refs)
-            if dep_id == task.id:
-                raise KilnError(f"task #{task.id} cannot depend on itself")
-            add_dependency(conn, task.id, dep_id)
+            if dep_id == job.id:
+                raise KilnError(f"job #{job.id} cannot depend on itself")
+            add_dependency(conn, job.id, dep_id)
         except KilnError as exc:
-            return f"created task #{task.id} {task.title}; dependency failed: {exc}"
+            return f"created job #{job.id} {job.title}; dependency failed: {exc}"
         linked.append(dep_id)
     if linked:
         deps = ", ".join(f"#{dep_id}" for dep_id in linked)
-        return f"created task #{task.id} {task.title} depending on {deps}"
-    return f"created task #{task.id} {task.title}"
+        return f"created job #{job.id} {job.title} depending on {deps}"
+    return f"created job #{job.id} {job.title}"
 
 
-def _scout(
-    conn: sqlite3.Connection,
-    config: Config,
-    goal: Goal,
-    action: dict,
-    *,
-    agent_bin: str | None,
-    reporter: Callable[[str], None] | None,
-) -> str:
-    outcome = run_scout(
-        conn,
-        config,
-        _text(action, "question"),
-        goal_id=goal.id,
-        agent_bin=agent_bin,
-        reporter=reporter,
-    )
-    if outcome.failure or outcome.job.status != JobStatus.completed:
-        return f"scout failed: {outcome.failure}"
-    return f"scout job #{outcome.job.id} completed"
+def _remember(refs: dict[str, int], action: dict, job_id: int, title: str) -> None:
+    ref = action.get("ref")
+    if isinstance(ref, str) and ref.strip():
+        refs[ref.strip()] = job_id
+    refs.setdefault(title, job_id)
 
 
 def _dispatch(
@@ -527,49 +624,49 @@ def _dispatch(
     agent_bin: str | None,
     reporter: Callable[[str], None] | None,
 ) -> str:
-    task_id = _resolve_task_ref(conn, goal, action, refs)
-    task = require_job(conn, task_id)
-    if task.status != JobStatus.pending:
-        raise KilnError(f"task #{task_id} is {task.status.value}; only a pending task can be dispatched")
-    if task.id not in {ready.id for ready in ready_jobs(conn, goal_id=goal.id)}:
-        raise KilnError(f"task #{task_id} is blocked")
-    outcome = run_worker(conn, config, task_id=task_id, agent_bin=agent_bin, reporter=reporter)
-    branch = outcome.job.branch or ""
-    line = f"task #{outcome.job.id}  {outcome.job.status.value}  {branch}"
-    if outcome.failure:
-        return f"{line}: {outcome.failure}"
-    return line
-
-
-def _review(
-    conn: sqlite3.Connection,
-    config: Config,
-    goal: Goal,
-    action: dict,
-    refs: dict[str, int],
-    *,
-    agent_bin: str | None,
-    reporter: Callable[[str], None] | None,
-) -> str:
-    task_id = _resolve_task_ref(conn, goal, action, refs)
-    outcome = run_reviewer(
-        conn,
-        config,
-        task_id,
-        focus=_optional_text(action, "focus"),
-        agent_bin=agent_bin,
-        reporter=reporter,
-    )
+    job_id = _resolve_job_ref(conn, goal, action, refs)
+    job = require_job(conn, job_id)
+    if job.status != JobStatus.pending:
+        raise KilnError(f"job #{job_id} is {job.status.value}; only a pending job can be dispatched")
+    if job.id not in {ready.id for ready in ready_jobs(conn, goal_id=goal.id)}:
+        raise KilnError(f"job #{job_id} is blocked")
+    if job.role == JobRole.worker:
+        outcome = run_worker(conn, config, task_id=job_id, agent_bin=agent_bin, reporter=reporter)
+        branch = outcome.job.branch or ""
+        line = f"job #{outcome.job.id}  {outcome.job.status.value}  {branch}"
+        if outcome.failure:
+            return f"{line}: {outcome.failure}"
+        return line
+    if job.role == JobRole.scout:
+        outcome = run_scout(conn, config, job_id=job.id, agent_bin=agent_bin, reporter=reporter)
+        if outcome.failure or outcome.job.status != JobStatus.completed:
+            return f"scout job #{outcome.job.id} failed: {outcome.failure}"
+        return f"scout job #{outcome.job.id} completed"
+    target = require_job(conn, job.target_job_id) if job.target_job_id is not None else None
+    if not (
+        target is not None
+        and target.role == JobRole.worker
+        and target.status == JobStatus.completed
+        and target.integration == Integration.pending
+        and target.branch
+    ):
+        state = "missing" if target is None else target.status.value
+        integration = "none" if target is None or target.integration is None else target.integration.value
+        raise KilnError(
+            f"job #{job.target_job_id} is {state} integration {integration}; "
+            "only a completed worker with pending integration can be reviewed"
+        )
+    outcome = run_reviewer(conn, config, target.id, job_id=job.id, agent_bin=agent_bin, reporter=reporter)
     if outcome.failure:
         return f"review failed: {outcome.failure}"
-    return f"reviewed #{task_id}: {outcome.verdict}"
+    return f"reviewed #{target.id}: {outcome.verdict}"
 
 
 def _finish_goal(conn: sqlite3.Connection, goal: Goal, action: dict) -> str:
-    open_tasks = [task for task in list_jobs(conn, goal_id=goal.id) if is_open(task)]
-    if open_tasks:
-        ids = ", ".join(f"#{task.id}" for task in open_tasks)
-        raise KilnError(f"goal #{goal.id} still has open tasks: {ids}")
+    open_jobs = [task for task in list_jobs(conn, goal_id=goal.id) if is_open(task)]
+    if open_jobs:
+        ids = ", ".join(f"#{task.id}" for task in open_jobs)
+        raise KilnError(f"goal #{goal.id} still has open jobs: {ids}")
     evidence = action.get("evidence")
     if not isinstance(evidence, list):
         raise KilnError("goal_done requires evidence")
@@ -578,13 +675,13 @@ def _finish_goal(conn: sqlite3.Connection, goal: Goal, action: dict) -> str:
     return f"goal #{goal.id} done"
 
 
-def _resolve_task_ref(conn: sqlite3.Connection, goal: Goal, action: dict, refs: dict[str, int]) -> int:
-    if "task_id" in action and action.get("task_id") is not None:
-        return _in_goal(conn, goal, _task_id(action))
+def _resolve_job_ref(conn: sqlite3.Connection, goal: Goal, action: dict, refs: dict[str, int]) -> int:
+    if "job_id" in action and action.get("job_id") is not None:
+        return _in_goal(conn, goal, _job_id(action))
     ref = action.get("ref")
     if isinstance(ref, str) and ref.strip() in refs:
         return _in_goal(conn, goal, refs[ref.strip()])
-    raise KilnError("action needs a task_id or ref")
+    raise KilnError("action needs a job_id or ref")
 
 
 def _availability(task: Job, deps: list[Job], ready_ids: set[int]) -> str:
@@ -616,7 +713,7 @@ def _resolve_dep(conn: sqlite3.Connection, goal_id: int, dep: object, refs: dict
     if len(matches) == 1:
         return matches[0].id
     if len(matches) > 1:
-        raise KilnError(f"title {text!r} matches more than one task")
+        raise KilnError(f"title {text!r} matches more than one job")
     raise KilnError(f"unknown dependency {dep!r}")
 
 
@@ -627,103 +724,39 @@ def _in_goal(conn: sqlite3.Connection, goal: Goal, task_id: int) -> int:
 def _task_in_goal(conn: sqlite3.Connection, goal_id: int, task_id: int) -> int:
     task = require_job(conn, task_id)
     if task.goal_id != goal_id:
-        raise KilnError(f"task #{task_id} is not in goal #{goal_id}")
+        raise KilnError(f"job #{task_id} is not in goal #{goal_id}")
     return task.id
 
 
-def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Job) -> list[str]:
+def _result_lines(raw: str | None) -> list[str]:
+    report = _object(raw)
+    if report is None:
+        return []
     lines: list[str] = []
-    if task.branch:
-        try:
-            base = goal.branch or config.base_branch
-            changes = diffstat(config.repo_root, base, task.branch)
-        except KilnError as exc:
-            changes = str(exc)
-        lines.append("  diffstat:")
-        lines.append(changes or "  (no changes)")
-    worker = latest_run(conn, task.id, "worker")
-    if worker is not None and worker.report_json:
-        lines.extend(_worker_report_lines(worker.report_json))
-    review_job = _latest_review(conn, task.id)
-    review = latest_run(conn, review_job.id, "reviewer") if review_job is not None else None
-    if review_job is not None and review_job.result and review is not None and (worker is None or review.id > worker.id):
-        lines.extend(_reviewer_report_lines(review_job.result))
-    return lines
-
-
-def _latest_review(conn: sqlite3.Connection, worker_id: int) -> Job | None:
-    matches = [
-        job
-        for job in jobs_targeting(conn, worker_id)
-        if job.role == JobRole.reviewer and job.status == JobStatus.completed and job.result
-    ]
-    return matches[-1] if matches else None
-
-
-def _result_summary(raw: str | None) -> str:
-    if not raw:
-        return ""
-    try:
-        report = json.loads(raw)
-    except json.JSONDecodeError:
-        return ""
-    if not isinstance(report, dict):
-        return ""
     summary = report.get("summary")
-    if isinstance(summary, str):
-        return summary.strip()
-    return ""
-
-
-def _worker_report_lines(raw: str) -> list[str]:
-    try:
-        report = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(report, dict):
-        return []
-    lines: list[str] = []
-    body = role_result(report)
-    worker = report.get("worker")
-    summary = body.get("summary") if isinstance(body.get("summary"), str) else None
-    if summary is None and isinstance(worker, dict) and isinstance(worker.get("summary"), str):
-        summary = worker["summary"]
     if isinstance(summary, str) and summary.strip():
-        lines.append(f"  summary: {summary.strip()}")
-    verify = body.get("verify") if isinstance(body.get("verify"), dict) else report.get("verify")
-    if isinstance(verify, dict) and verify.get("command"):
-        code = verify.get("exit_code")
-        output = verify.get("output") or ""
-        if not isinstance(output, str):
-            output = str(output)
-        tail = "\n".join(output.splitlines()[-20:])
-        lines.append(f"  verify exit {code}")
-        if tail:
-            lines.append(tail)
+        lines.append(f"  result: {summary.strip()}")
+    evidence = report.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, str) and item.strip():
+                lines.append(f"  evidence: {item.strip()}")
+    verdict = role_result(report).get("verdict")
+    if isinstance(verdict, str) and verdict.strip():
+        lines.append(f"  verdict: {verdict.strip()}")
     return lines
 
 
-def _reviewer_report_lines(raw: str) -> list[str]:
+def _object(raw: str | None) -> dict | None:
+    if not raw:
+        return None
     try:
         report = json.loads(raw)
     except json.JSONDecodeError:
-        return []
+        return None
     if not isinstance(report, dict):
-        return []
-    body = role_result(report)
-    verdict = body.get("verdict")
-    summary = body.get("summary") if isinstance(body.get("summary"), str) else report.get("summary")
-    if not isinstance(verdict, str) or not isinstance(summary, str):
-        return []
-    lines = [f"  review: {verdict} — {summary}"]
-    findings = body.get("findings")
-    if not isinstance(findings, list):
-        findings = report.get("findings")
-    if isinstance(findings, list):
-        for item in findings:
-            if isinstance(item, str) and item.strip():
-                lines.append(f"  - {item.strip()}")
-    return lines
+        return None
+    return report
 
 
 def _failure(result) -> str | None:
@@ -761,8 +794,16 @@ def _priority(action: dict) -> int:
     return value
 
 
-def _task_id(action: dict) -> int:
-    value = action.get("task_id")
+def _role(action: dict) -> JobRole:
+    text = _text(action, "role")
+    try:
+        return JobRole(text)
+    except ValueError:
+        raise KilnError("role must be scout, worker, or reviewer") from None
+
+
+def _job_id(action: dict) -> int:
+    value = action.get("job_id")
     if isinstance(value, bool) or not isinstance(value, int):
-        raise KilnError("task_id must be an integer")
+        raise KilnError("job_id must be an integer")
     return value

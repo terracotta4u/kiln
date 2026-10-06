@@ -195,7 +195,7 @@ def _claim(conn: sqlite3.Connection, task_id: int | None, worker: str) -> Job:
     while True:
         ready = [job for job in ready_jobs(conn) if job.role == JobRole.worker]
         if not ready:
-            raise KilnError("no ready task")
+            raise KilnError("no ready job")
         candidate = ready[0]
         if candidate.attempts >= candidate.max_attempts:
             fail_job(conn, candidate.id, f"exhausted {candidate.max_attempts} attempts")

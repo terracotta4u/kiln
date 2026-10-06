@@ -249,7 +249,7 @@ def test_cli_work(factory: Path, monkeypatch: pytest.MonkeyPatch):
     script = _agent(factory, _write_and_report("from the cli", "hello.txt"))
     monkeypatch.setenv("KILN_AGENT_BIN", str(script))
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
-    assert runner.invoke(app, ["task", "add", "1", "Add hello"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Add hello"]).exit_code == 0
     result = runner.invoke(app, ["work"])
     assert result.exit_code == 0, result.output
     assert "completed" in result.output
@@ -257,7 +257,7 @@ def test_cli_work(factory: Path, monkeypatch: pytest.MonkeyPatch):
     assert "hello.txt" in result.output
     again = runner.invoke(app, ["work"])
     assert again.exit_code != 0
-    assert "no ready task" in again.output
+    assert "no ready job" in again.output
 
 
 def _write_and_report(summary: str, filename: str) -> str:

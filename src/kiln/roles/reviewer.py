@@ -43,35 +43,54 @@ class ReviewOutcome:
 def run_reviewer(
     conn: sqlite3.Connection,
     config: Config,
-    task_id: int,
+    task_id: int | None = None,
     *,
+    job_id: int | None = None,
     focus: str = "",
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
 ) -> ReviewOutcome:
-    """Review a completed worker. The verdict is stored on a new reviewer job and leaves the worker alone."""
-    task = require_job(conn, task_id)
+    """Review a completed worker. The verdict is stored on the reviewer job and leaves the worker alone.
+
+    Without job_id, this creates the reviewer job. Dispatch passes job_id so the existing job runs.
+    """
+    review: Job | None = None
+    if job_id is not None:
+        review = require_job(conn, job_id)
+        if review.role != JobRole.reviewer or review.target_job_id is None:
+            raise KilnError(f"job #{job_id} is not a reviewer job")
+        if review.status != JobStatus.pending:
+            raise KilnError(
+                f"job #{review.id} is {review.status.value}; only a pending job can be dispatched"
+            )
+        task = require_job(conn, review.target_job_id)
+        focus = review.focus or focus
+    else:
+        if task_id is None:
+            raise KilnError("a reviewer needs a worker to review")
+        task = require_job(conn, task_id)
     if not (
         task.role == JobRole.worker
         and task.status == JobStatus.completed
         and task.integration == Integration.pending
     ):
         raise KilnError(
-            f"task #{task_id} is {task.status.value}; only a completed worker with pending integration can be reviewed"
+            f"job #{task.id} is {task.status.value}; only a completed worker with pending integration can be reviewed"
         )
     if not task.branch:
-        raise KilnError(f"task #{task_id} has no branch to review")
-    review = add_job(
-        conn,
-        task.goal_id,
-        f"Review {task.title}",
-        role=JobRole.reviewer,
-        focus=focus.strip(),
-        target_job_id=task.id,
-        depends_on=[task.id],
-        max_attempts=config.max_attempts,
-    )
+        raise KilnError(f"job #{task.id} has no branch to review")
+    if review is None:
+        review = add_job(
+            conn,
+            task.goal_id,
+            f"Review {task.title}",
+            role=JobRole.reviewer,
+            focus=focus.strip(),
+            target_job_id=task.id,
+            depends_on=[task.id],
+            max_attempts=config.max_attempts,
+        )
     claimed = claim_job(conn, review.id, f"kiln-reviewer-{os.getpid()}")
     if claimed is None:
         raise KilnError(f"job #{review.id} is not ready")

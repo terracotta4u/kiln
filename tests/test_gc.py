@@ -56,7 +56,7 @@ def test_cleanup_drops_finished_worktrees_and_keeps_live_ones(factory: Path):
     finally:
         conn.close()
 
-    assert any("removed worktree for task #1" in line for line in lines)
+    assert any("removed worktree for job #1" in line for line in lines)
     assert any("deleted branch kiln/1-schema" in line for line in lines)
     assert any("removed leftover 99" in line for line in lines)
     assert again == []
@@ -93,9 +93,9 @@ def test_cleanup_keeps_a_merged_branch_when_configured(factory: Path):
     finally:
         conn.close()
 
-    assert any("would remove worktree for task #1" in line for line in preview)
+    assert any("would remove worktree for job #1" in line for line in preview)
     assert not any("would delete branch" in line for line in preview)
-    assert any("removed worktree for task #1" in line for line in lines)
+    assert any("removed worktree for job #1" in line for line in lines)
     assert stored is not None and stored.branch == "kiln/1-schema"
     assert branch_exists(factory, "kiln/1-schema")
     assert not (factory / ".kiln" / "worktrees" / "1").exists()
@@ -117,7 +117,7 @@ def test_cleanup_leaves_a_worktree_outside_kiln(factory: Path, tmp_path: Path):
     finally:
         conn.close()
 
-    assert any("left worktree for task #1" in line for line in lines)
+    assert any("left worktree for job #1" in line for line in lines)
     assert (outside / "keep.txt").is_file()
 
 
@@ -138,8 +138,8 @@ def test_tick_cleans_before_the_foreman(factory: Path):
     finally:
         conn.close()
 
-    assert any("would remove worktree for task #1" in line for line in dry.lines)
-    assert any("removed worktree for task #1" in line for line in result.lines)
+    assert any("would remove worktree for job #1" in line for line in dry.lines)
+    assert any("removed worktree for job #1" in line for line in result.lines)
     assert not (factory / ".kiln" / "worktrees" / "1").exists()
 
 
@@ -156,7 +156,7 @@ def test_cli_gc(factory: Path):
 
     cleaned = runner.invoke(app, ["gc"])
     assert cleaned.exit_code == 0, cleaned.output
-    assert "removed worktree for task #1" in cleaned.output
+    assert "removed worktree for job #1" in cleaned.output
     assert "deleted branch kiln/1-schema" in cleaned.output
     again = runner.invoke(app, ["gc"])
     assert again.exit_code == 0, again.output

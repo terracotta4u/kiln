@@ -8,7 +8,7 @@ Goal #{{goal_id}}: {{goal_title}}
 Brief:
 {{brief}}
 
-Task #{{task_id}}: {{title}}
+Job #{{task_id}}: {{title}}
 
 Description:
 {{description}}

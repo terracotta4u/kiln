@@ -84,7 +84,9 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
     assert "check the marker" in log
     assert "needs_changes" in brief
     assert "marker is one line" in brief
-    assert "needs_changes" not in hidden
+    assert "diffstat" not in brief
+    assert "needs_changes" in hidden
+    assert "added marker" in hidden
 
 
 def test_reviewer_truncates_a_long_diff(factory: Path):

@@ -14,9 +14,10 @@ from kiln.jobs import (
     fail_job,
     list_goals,
     require_goal,
+    require_job,
     start_execution,
 )
-from kiln.models import Goal, GoalStatus, Job, JobRole, Run, RunStatus
+from kiln.models import Goal, GoalStatus, Job, JobRole, JobStatus, Run, RunStatus
 from kiln.prompts import render_prompt
 from kiln.result import envelope
 from kiln.runs import finish_run, start_run
@@ -34,26 +35,41 @@ class ScoutOutcome:
 def run_scout(
     conn: sqlite3.Connection,
     config: Config,
-    question: str,
+    question: str = "",
     *,
+    job_id: int | None = None,
     goal_id: int | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
 ) -> ScoutOutcome:
-    """Create a scout job, run it read-only, and store the report as its result."""
-    question = question.strip()
-    if not question:
-        raise KilnError("scout question cannot be empty")
-    goal = _resolve_goal(conn, goal_id)
-    job = add_job(
-        conn,
-        goal.id,
-        question,
-        role=JobRole.scout,
-        question=question,
-        max_attempts=config.max_attempts,
-    )
+    """Run a scout job read-only and store the report as its result.
+
+    Without job_id, this creates the job. Dispatch passes job_id so the existing job runs.
+    """
+    if job_id is None:
+        question = question.strip()
+        if not question:
+            raise KilnError("scout question cannot be empty")
+        goal = _resolve_goal(conn, goal_id)
+        job = add_job(
+            conn,
+            goal.id,
+            question,
+            role=JobRole.scout,
+            question=question,
+            max_attempts=config.max_attempts,
+        )
+    else:
+        job = require_job(conn, job_id)
+        if job.role != JobRole.scout:
+            raise KilnError(f"job #{job.id} is a {job.role.value}; only a scout job can run here")
+        if job.status != JobStatus.pending:
+            raise KilnError(f"job #{job.id} is {job.status.value}; only a pending job can be dispatched")
+        question = job.question.strip()
+        if not question:
+            raise KilnError("scout question cannot be empty")
+        goal = require_goal(conn, job.goal_id)
     claimed = claim_job(conn, job.id, f"kiln-scout-{os.getpid()}")
     if claimed is None:
         raise KilnError(f"job #{job.id} is not ready")

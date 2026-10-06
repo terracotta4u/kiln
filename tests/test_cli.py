@@ -71,23 +71,23 @@ def test_goal_and_task_flow(repo):
     assert "\nbrief\n(none)" in shown_goal.output
     assert "\nevidence\n(none)" in shown_goal.output
 
-    first = runner.invoke(app, ["task", "add", "1", "Schema", "--priority", "1"])
+    first = runner.invoke(app, ["job", "add", "1", "Schema", "--priority", "1"])
     second = runner.invoke(
         app,
-        ["task", "add", "1", "CLI", "--depends-on", "1", "--acceptance", "commands work"],
+        ["job", "add", "1", "CLI", "--depends-on", "1", "--acceptance", "commands work"],
     )
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
 
-    cycle = runner.invoke(app, ["task", "dep", "1", "2"])
+    cycle = runner.invoke(app, ["job", "dep", "1", "2"])
     assert cycle.exit_code != 0
     assert "cycle" in cycle.output
 
-    pending = runner.invoke(app, ["task", "list", "--status", "pending"])
+    pending = runner.invoke(app, ["job", "list", "--status", "pending"])
     assert "Schema" in pending.output
     assert "deps: #1" in pending.output
 
-    shown = runner.invoke(app, ["task", "show", "2"])
+    shown = runner.invoke(app, ["job", "show", "2"])
     assert shown.exit_code == 0, shown.output
     assert "attempts    0/7" in shown.output
     assert "commands work" in shown.output
@@ -102,7 +102,7 @@ def test_goal_and_task_flow(repo):
     assert missing.exit_code != 0
     assert "no goal with id 9" in missing.output
 
-    cancelled = runner.invoke(app, ["task", "cancel", "2"])
+    cancelled = runner.invoke(app, ["job", "cancel", "2"])
     assert cancelled.exit_code == 0, cancelled.output
     assert "cancelled #2" in cancelled.output
 
@@ -121,7 +121,7 @@ def test_log_and_runs_show(repo):
     assert "no events" in empty.output
 
     assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
-    assert runner.invoke(app, ["task", "add", "1", "Schema"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Schema"]).exit_code == 0
     logged = runner.invoke(app, ["log"])
     assert logged.exit_code == 0, logged.output
     assert logged.output.index("goal.created") < logged.output.index("job.created")
