@@ -94,6 +94,11 @@ def branch_diff(repo: Path, base: str, branch: str) -> str:
     return result.stdout
 
 
+def revision(repo: Path) -> str:
+    """Current commit of a checkout."""
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
 def commit_if_dirty(worktree: Path, message: str) -> bool:
     """Commit tracked and untracked changes. Returns whether a commit was made."""
     status = _git(worktree, "status", "--porcelain")

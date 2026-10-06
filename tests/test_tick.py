@@ -132,15 +132,18 @@ def test_scout_action_runs_during_the_tick(factory: Path):
         goal = add_goal(conn, "Ship it")
         add_job(conn, goal.id, "Existing")
         first = run_tick(conn, config, agent_bin=str(script))
-        notes_after_first = list_notes(conn, goal.id)
+        scout_jobs = [job for job in list_jobs(conn, goal_id=goal.id) if job.role.value == "scout"]
         second = run_tick(conn, config, agent_bin=str(script))
         notes = list_notes(conn, goal.id)
     finally:
         conn.close()
 
-    assert any("scout note" in line for line in first.lines)
-    assert notes_after_first and "scout-me please" in notes_after_first[0].text
-    assert len(notes) == 1
+    assert any("scout job" in line for line in first.lines)
+    assert len(scout_jobs) == 1
+    assert scout_jobs[0].question == "scout-me please"
+    assert scout_jobs[0].status.value == "completed"
+    assert json.loads(scout_jobs[0].result or "")["summary"] == "answered"
+    assert notes == []
     assert any("no actions" in line for line in second.lines)
 
 

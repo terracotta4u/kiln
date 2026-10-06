@@ -10,7 +10,7 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
 from kiln.git import commit_if_dirty, remove_worktree
-from kiln.models import JobStatus, RunStatus
+from kiln.models import Integration, JobRole, JobStatus, RunStatus
 from kiln.roles.foreman import goal_brief
 from kiln.roles.reviewer import DIFF_CHAR_LIMIT, run_reviewer
 from kiln.roles.worker import run_worker
@@ -64,8 +64,16 @@ def test_reviewer_sees_the_diff_and_leaves_the_task_in_review(factory: Path):
 
     assert outcome.failure is None
     assert outcome.verdict == "needs_changes"
+    assert outcome.job.role == JobRole.reviewer
+    assert outcome.job.target_job_id == task.id
+    assert outcome.job.status == JobStatus.completed
+    review = json.loads(outcome.job.result or "")
+    assert review["role_result"]["verdict"] == "needs_changes"
     assert stored is not None
     assert stored.status == JobStatus.completed
+    assert stored.integration == Integration.pending
+    worker_result = json.loads(stored.result or "")
+    assert worker_result["summary"] == "added marker"
     assert (Path(stored.worktree_path or "") / "reviewer-was-here").is_file()
     assert not (factory / "reviewer-was-here").exists()
     command, _prompt = log.split("--- prompt ---", 1)
@@ -130,7 +138,12 @@ def test_reviewer_records_a_bad_report_as_a_failure(factory: Path):
 
     assert outcome.failure == "response had no JSON report"
     assert outcome.run.status == RunStatus.failed
+    assert outcome.job.role == JobRole.reviewer
+    assert outcome.job.status == JobStatus.failed
+    assert outcome.job.result is None
     assert stored is not None and stored.status == JobStatus.completed
+    assert stored.integration == Integration.pending
+    assert stored.result is not None
 
 
 def _worker_script() -> str:

@@ -12,7 +12,7 @@ from kiln.config import init_factory, load_config
 from kiln.db import connect
 from kiln.errors import KilnError
 from kiln.jobs import add_dependency, add_goal, add_job, get_job
-from kiln.models import JobStatus, RunStatus
+from kiln.models import Integration, JobStatus, RunStatus
 from kiln.roles.worker import run_worker
 
 runner = CliRunner()
@@ -50,6 +50,12 @@ def test_worker_commits_on_a_branch_and_leaves_the_task_in_review(factory: Path,
     assert outcome.summary == "added hello"
     assert stored is not None
     assert stored.status == JobStatus.completed
+    assert stored.integration == Integration.pending
+    result = json.loads(stored.result or "")
+    assert result["summary"] == "added hello"
+    assert result["artifacts"] == [{"type": "branch", "name": "kiln/1-add-hello"}]
+    assert result["role_result"]["files"] == ["hello.txt"]
+    assert result["role_result"]["committed"] is True
     assert stored.attempts == 1
     assert stored.branch == "kiln/1-add-hello"
     assert "hello.txt" in outcome.diffstat
@@ -106,6 +112,10 @@ def test_verify_failure_still_reaches_review(factory: Path):
         conn.close()
 
     assert outcome.job.status == JobStatus.completed
+    assert outcome.job.integration == Integration.pending
+    result = json.loads(outcome.job.result or "")
+    assert "verify exited 3" in result["evidence"][0]
+    assert result["role_result"]["verify"]["exit_code"] == 3
     assert outcome.run.status == RunStatus.failed
     assert outcome.failure is not None
     assert "verify exited 3" in outcome.failure
@@ -131,7 +141,29 @@ def test_missing_report_still_commits(factory: Path):
 
     assert outcome.failure == "response had no JSON report"
     assert outcome.job.status == JobStatus.completed
+    assert outcome.job.integration == Integration.pending
+    result = json.loads(outcome.job.result or "")
+    assert result["summary"] == f"committed {outcome.job.branch}"
+    assert result["evidence"] == ["response had no JSON report"]
     assert _commit_count(factory, outcome.job.branch or "") == 1
+
+
+def test_a_worker_that_does_not_commit_fails(factory: Path):
+    script = _agent(factory, _print_report("nothing to change", []))
+    config = load_config(factory)
+    conn = connect(config.db_path)
+    try:
+        goal = add_goal(conn, "Ship it")
+        task = add_job(conn, goal.id, "Add hello")
+        outcome = run_worker(conn, config, task_id=task.id, agent_bin=str(script))
+    finally:
+        conn.close()
+
+    assert outcome.failure == "no commit was produced"
+    assert outcome.job.status == JobStatus.failed
+    assert outcome.job.integration is None
+    assert outcome.job.result is None
+    assert outcome.run.status == RunStatus.failed
 
 
 def test_exhausted_task_is_failed_and_the_next_ready_task_is_taken(factory: Path):

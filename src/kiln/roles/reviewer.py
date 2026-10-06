@@ -1,6 +1,7 @@
-"""Independent read-only review of a task branch."""
+"""Independent read-only review of a worker branch."""
 
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,10 +12,19 @@ from kiln.config import Config
 from kiln.db import record_event
 from kiln.errors import KilnError
 from kiln.git import branch_diff, ensure_worktree
-from kiln.jobs import require_goal, require_job
+from kiln.jobs import (
+    add_job,
+    claim_job,
+    complete_job,
+    fail_job,
+    require_goal,
+    require_job,
+    start_execution,
+)
 from kiln.models import Integration, Job, JobRole, JobStatus, Run, RunStatus
 from kiln.prompts import render_prompt
 from kiln.publish import ensure_goal_branch
+from kiln.result import envelope, role_result
 from kiln.runs import finish_run, latest_run, start_run
 
 DIFF_CHAR_LIMIT = 12_000
@@ -40,7 +50,7 @@ def run_reviewer(
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
 ) -> ReviewOutcome:
-    """Review a task that is waiting in review. The task status stays put."""
+    """Review a completed worker. The verdict is stored on a new reviewer job and leaves the worker alone."""
     task = require_job(conn, task_id)
     if not (
         task.role == JobRole.worker
@@ -52,14 +62,28 @@ def run_reviewer(
         )
     if not task.branch:
         raise KilnError(f"task #{task_id} has no branch to review")
+    review = add_job(
+        conn,
+        task.goal_id,
+        f"Review {task.title}",
+        role=JobRole.reviewer,
+        focus=focus.strip(),
+        target_job_id=task.id,
+        depends_on=[task.id],
+        max_attempts=config.max_attempts,
+    )
+    claimed = claim_job(conn, review.id, f"kiln-reviewer-{os.getpid()}")
+    if claimed is None:
+        raise KilnError(f"job #{review.id} is not ready")
+    review = start_execution(conn, claimed.id)
     goal = require_goal(conn, task.goal_id)
     integration, _ = ensure_goal_branch(conn, config, goal)
     worktree = Path(task.worktree_path) if task.worktree_path else config.worktrees_dir / str(task.id)
     ensure_worktree(config.repo_root, worktree, task.branch, integration)
 
-    run = start_run(conn, role="reviewer", model=config.models.reviewer, job_id=task.id)
+    run = start_run(conn, role="reviewer", model=config.models.reviewer, job_id=review.id)
     if reporter:
-        reporter(f"reviewing task #{task.id} with {config.models.reviewer}")
+        reporter(f"reviewing job #{review.id} target #{task.id} with {config.models.reviewer}")
     log_path = config.runs_dir / f"{run.id}.log"
     prompt = render_prompt(
         "reviewer.md",
@@ -98,7 +122,8 @@ def run_reviewer(
             log_path=None,
             report=None,
         )
-        record_event(conn, "review.failed", str(exc), job_id=task.id, run_id=finished.id)
+        fail_job(conn, review.id, str(exc))
+        record_event(conn, "review.failed", str(exc), job_id=review.id, run_id=finished.id)
         raise
 
     failure = _failure(result, timeout)
@@ -106,27 +131,43 @@ def run_reviewer(
     if failure is None and isinstance(report, str):
         failure = report
         report = None
+    if failure or not isinstance(report, dict):
+        reason = failure or "response had no review"
+        finished = finish_run(
+            conn,
+            run.id,
+            status=RunStatus.failed,
+            exit_code=result.exit_code,
+            log_path=str(result.log_path),
+            report=None,
+        )
+        failed = fail_job(conn, review.id, reason)
+        record_event(conn, "review.failed", reason, job_id=review.id, run_id=finished.id)
+        return ReviewOutcome(job=failed, run=finished, failure=reason, verdict=None, summary="")
+    stored = envelope(
+        summary=report["summary"],
+        evidence=list(report["findings"]),
+        artifacts=[{"type": "branch", "name": task.branch}],
+        role_result=report,
+    )
     finished = finish_run(
         conn,
         run.id,
-        status=RunStatus.failed if failure else RunStatus.succeeded,
+        status=RunStatus.succeeded,
         exit_code=result.exit_code,
         log_path=str(result.log_path),
-        report=report if isinstance(report, dict) else None,
+        report=stored,
     )
-    if failure:
-        record_event(conn, "review.failed", failure, job_id=task.id, run_id=finished.id)
-        return ReviewOutcome(job=require_job(conn, task.id), run=finished, failure=failure, verdict=None, summary="")
-    assert isinstance(report, dict)
+    completed = complete_job(conn, review.id, stored)
     record_event(
         conn,
         "review.completed",
         f"{report['verdict']}: {report['summary']}",
-        job_id=task.id,
+        job_id=completed.id,
         run_id=finished.id,
     )
     return ReviewOutcome(
-        job=require_job(conn, task.id),
+        job=completed,
         run=finished,
         failure=None,
         verdict=str(report["verdict"]),
@@ -154,7 +195,7 @@ def _verify_text(conn: sqlite3.Connection, task_id: int) -> str:
         return "(none)"
     if not isinstance(report, dict):
         return "(none)"
-    verify = report.get("verify")
+    verify = role_result(report).get("verify")
     if not isinstance(verify, dict) or not verify.get("command"):
         return "(none)"
     output = verify.get("output") or ""

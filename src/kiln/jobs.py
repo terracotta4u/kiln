@@ -238,6 +238,14 @@ def dependencies(conn: sqlite3.Connection, job_id: int) -> list[Job]:
     return [Job.from_row(row) for row in rows]
 
 
+def jobs_targeting(conn: sqlite3.Connection, target_job_id: int) -> list[Job]:
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE target_job_id = ? ORDER BY id ASC",
+        (target_job_id,),
+    ).fetchall()
+    return [Job.from_row(row) for row in rows]
+
+
 def dependents(conn: sqlite3.Connection, job_id: int) -> list[Job]:
     rows = conn.execute(
         """
@@ -358,6 +366,27 @@ def release_claim(conn: sqlite3.Connection, job_id: int) -> Job:
     )
     record_event(conn, "job.released", f"released claim on job #{job_id}", job_id=job_id)
     return require_job(conn, job_id)
+
+
+def start_execution(conn: sqlite3.Connection, job_id: int) -> Job:
+    """Count an attempt and mark the job running. Workers with a checkout use start_attempt."""
+    require_job(conn, job_id)
+    conn.execute(
+        """
+        UPDATE jobs
+        SET status = ?, attempts = attempts + 1, updated_at = ?
+        WHERE id = ?
+        """,
+        (JobStatus.running.value, utc_now(), job_id),
+    )
+    job = require_job(conn, job_id)
+    record_event(
+        conn,
+        "job.attempt",
+        f"attempt {job.attempts}/{job.max_attempts}",
+        job_id=job_id,
+    )
+    return job
 
 
 def start_attempt(conn: sqlite3.Connection, job_id: int, *, branch: str, worktree_path: str) -> Job:

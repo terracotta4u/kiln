@@ -79,16 +79,16 @@ def scout(
     question: str = typer.Argument(help="What the scout should find out."),
     goal: int | None = typer.Option(None, "--goal", "-g", help="Goal to attach the report to."),
 ) -> None:
-    """Send a read-only scout and store its report as a note."""
+    """Send a read-only scout and store its report on a job."""
 
     def render(config: Config, conn) -> None:
         outcome = run_scout(conn, config, question, goal_id=goal, reporter=typer.echo)
-        if outcome.note is None:
+        if outcome.failure:
             raise KilnError(
                 f"scout failed: {outcome.failure} (run #{outcome.run.id}, log {outcome.run.log_path})"
             )
-        typer.echo(f"\nnote #{outcome.note.id} on goal #{outcome.goal.id}")
-        typer.echo(outcome.note.text)
+        typer.echo(f"\njob #{outcome.job.id}  {outcome.job.status.value}")
+        typer.echo(outcome.summary)
 
     _with_db(render)
 
@@ -116,6 +116,8 @@ def work(
             typer.echo(f"\n{outcome.summary}")
         if outcome.diffstat:
             typer.echo(f"\n{outcome.diffstat}")
+        if outcome.job.status == JobStatus.failed:
+            raise KilnError(f"task #{outcome.job.id} failed: {outcome.failure}")
         if outcome.failure:
             raise KilnError(f"task #{outcome.job.id} completed with a problem: {outcome.failure}")
 

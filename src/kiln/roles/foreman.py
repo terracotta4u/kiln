@@ -18,6 +18,7 @@ from kiln.jobs import (
     dependency_satisfied,
     fail_job,
     is_open,
+    jobs_targeting,
     list_jobs,
     ready_jobs,
     require_goal,
@@ -26,13 +27,14 @@ from kiln.jobs import (
     set_goal_evidence,
     set_goal_status,
 )
-from kiln.models import Goal, GoalStatus, Integration, Job, JobStatus, Run, RunStatus
+from kiln.models import Goal, GoalStatus, Integration, Job, JobRole, JobStatus, Run, RunStatus
 from kiln.notes import add_note, list_notes
 from kiln.prompts import render_prompt
 from kiln.review import approve_task, reject_task, send_back
 from kiln.roles.reviewer import run_reviewer
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
+from kiln.result import role_result
 from kiln.runs import finish_run, latest_run, start_run
 
 _AGENT_TYPES = frozenset({"scout", "dispatch", "review"})
@@ -90,6 +92,9 @@ def goal_brief(
         )
         if task.feedback:
             lines.append(f"  feedback: {task.feedback}")
+        summary = _result_summary(task.result)
+        if summary:
+            lines.append(f"  result: {summary}")
         if (
             task.role.value == "worker"
             and task.status == JobStatus.completed
@@ -507,9 +512,9 @@ def _scout(
         agent_bin=agent_bin,
         reporter=reporter,
     )
-    if outcome.note is None:
+    if outcome.failure or outcome.job.status != JobStatus.completed:
         return f"scout failed: {outcome.failure}"
-    return f"scout note #{outcome.note.id} on goal #{goal.id}"
+    return f"scout job #{outcome.job.id} completed"
 
 
 def _dispatch(
@@ -639,10 +644,35 @@ def _review_lines(conn: sqlite3.Connection, config: Config, goal: Goal, task: Jo
     worker = latest_run(conn, task.id, "worker")
     if worker is not None and worker.report_json:
         lines.extend(_worker_report_lines(worker.report_json))
-    review = latest_run(conn, task.id, "reviewer")
-    if review is not None and review.report_json and (worker is None or review.id > worker.id):
-        lines.extend(_reviewer_report_lines(review.report_json))
+    review_job = _latest_review(conn, task.id)
+    review = latest_run(conn, review_job.id, "reviewer") if review_job is not None else None
+    if review_job is not None and review_job.result and review is not None and (worker is None or review.id > worker.id):
+        lines.extend(_reviewer_report_lines(review_job.result))
     return lines
+
+
+def _latest_review(conn: sqlite3.Connection, worker_id: int) -> Job | None:
+    matches = [
+        job
+        for job in jobs_targeting(conn, worker_id)
+        if job.role == JobRole.reviewer and job.status == JobStatus.completed and job.result
+    ]
+    return matches[-1] if matches else None
+
+
+def _result_summary(raw: str | None) -> str:
+    if not raw:
+        return ""
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(report, dict):
+        return ""
+    summary = report.get("summary")
+    if isinstance(summary, str):
+        return summary.strip()
+    return ""
 
 
 def _worker_report_lines(raw: str) -> list[str]:
@@ -653,10 +683,14 @@ def _worker_report_lines(raw: str) -> list[str]:
     if not isinstance(report, dict):
         return []
     lines: list[str] = []
+    body = role_result(report)
     worker = report.get("worker")
-    if isinstance(worker, dict) and isinstance(worker.get("summary"), str):
-        lines.append(f"  summary: {worker['summary']}")
-    verify = report.get("verify")
+    summary = body.get("summary") if isinstance(body.get("summary"), str) else None
+    if summary is None and isinstance(worker, dict) and isinstance(worker.get("summary"), str):
+        summary = worker["summary"]
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"  summary: {summary.strip()}")
+    verify = body.get("verify") if isinstance(body.get("verify"), dict) else report.get("verify")
     if isinstance(verify, dict) and verify.get("command"):
         code = verify.get("exit_code")
         output = verify.get("output") or ""
@@ -676,12 +710,15 @@ def _reviewer_report_lines(raw: str) -> list[str]:
         return []
     if not isinstance(report, dict):
         return []
-    verdict = report.get("verdict")
-    summary = report.get("summary")
+    body = role_result(report)
+    verdict = body.get("verdict")
+    summary = body.get("summary") if isinstance(body.get("summary"), str) else report.get("summary")
     if not isinstance(verdict, str) or not isinstance(summary, str):
         return []
     lines = [f"  review: {verdict} — {summary}"]
-    findings = report.get("findings")
+    findings = body.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("findings")
     if isinstance(findings, list):
         for item in findings:
             if isinstance(item, str) and item.strip():
