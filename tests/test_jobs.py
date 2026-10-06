@@ -34,16 +34,15 @@ def conn(tmp_path):
 
 def test_migrate_is_idempotent(conn):
     migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
 
 
-def test_older_task_databases_are_refused(tmp_path):
+def test_a_newer_database_is_refused(tmp_path):
     connection = connect(tmp_path / "kiln.db")
     try:
-        for version in (1, 3, 4):
-            connection.execute(f"PRAGMA user_version = {version}")
-            with pytest.raises(KilnError, match="delete .kiln"):
-                migrate(connection)
+        connection.execute("PRAGMA user_version = 2")
+        with pytest.raises(KilnError, match="newer than this kiln"):
+            migrate(connection)
     finally:
         connection.close()
 

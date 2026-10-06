@@ -5,9 +5,9 @@ from pathlib import Path
 from kiln.errors import KilnError
 from kiln.models import Event
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 1
 
-SCHEMA_V5 = """
+SCHEMA = """
 CREATE TABLE goals (
     id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
@@ -109,13 +109,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             f"database version {version} is newer than this kiln (supports {SCHEMA_VERSION})"
         )
     if version < 1:
-        conn.executescript(SCHEMA_V5)
+        conn.executescript(SCHEMA)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        return
-    if version < SCHEMA_VERSION:
-        raise KilnError(
-            "this factory was created by an older kiln that used tasks; delete .kiln and run kiln init"
-        )
 
 
 def list_events(conn: sqlite3.Connection, *, limit: int) -> list[Event]:
