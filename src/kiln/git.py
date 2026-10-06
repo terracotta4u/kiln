@@ -16,8 +16,8 @@ class MergeResult:
     message: str
 
 
-def branch_name(task_id: int, title: str) -> str:
-    return f"kiln/{task_id}-{_slug(title, 'task')}"
+def branch_name(job_id: int, title: str) -> str:
+    return f"kiln/{job_id}-{_slug(title, 'job')}"
 
 
 def goal_branch_name(goal_id: int, title: str) -> str:

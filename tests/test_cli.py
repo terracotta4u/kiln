@@ -53,7 +53,7 @@ def test_init_outside_a_git_repo_fails(tmp_path, monkeypatch):
     assert "git repository" in result.output
 
 
-def test_goal_and_task_flow(repo):
+def test_goal_and_job_flow(repo):
     assert runner.invoke(app, ["init"]).exit_code == 0
     toml = (repo / "kiln.toml").read_text().replace("max_attempts = 3", "max_attempts = 7")
     (repo / "kiln.toml").write_text(toml)
@@ -161,7 +161,7 @@ def test_log_and_runs_show(repo):
     assert shown.exit_code == 0, shown.output
     assert "composer-2.5" in shown.output
     assert "readme exists" in shown.output
-    assert "task        (none)" in shown.output
+    assert "job         (none)" in shown.output
     assert "... 5 earlier lines" in shown.output
     assert "line 44" in shown.output
     assert "line 0\n" not in shown.output

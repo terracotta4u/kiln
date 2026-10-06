@@ -43,7 +43,7 @@ class ReviewOutcome:
 def run_reviewer(
     conn: sqlite3.Connection,
     config: Config,
-    task_id: int | None = None,
+    worker_id: int | None = None,
     *,
     job_id: int | None = None,
     focus: str = "",
@@ -64,45 +64,45 @@ def run_reviewer(
             raise KilnError(
                 f"job #{review.id} is {review.status.value}; only a pending job can be dispatched"
             )
-        task = require_job(conn, review.target_job_id)
+        worker = require_job(conn, review.target_job_id)
         focus = review.focus or focus
     else:
-        if task_id is None:
+        if worker_id is None:
             raise KilnError("a reviewer needs a worker to review")
-        task = require_job(conn, task_id)
+        worker = require_job(conn, worker_id)
     if not (
-        task.role == JobRole.worker
-        and task.status == JobStatus.completed
-        and task.integration == Integration.pending
+        worker.role == JobRole.worker
+        and worker.status == JobStatus.completed
+        and worker.integration == Integration.pending
     ):
         raise KilnError(
-            f"job #{task.id} is {task.status.value}; only a completed worker with pending integration can be reviewed"
+            f"job #{worker.id} is {worker.status.value}; only a completed worker with pending integration can be reviewed"
         )
-    if not task.branch:
-        raise KilnError(f"job #{task.id} has no branch to review")
+    if not worker.branch:
+        raise KilnError(f"job #{worker.id} has no branch to review")
     if review is None:
         review = add_job(
             conn,
-            task.goal_id,
-            f"Review {task.title}",
+            worker.goal_id,
+            f"Review {worker.title}",
             role=JobRole.reviewer,
             focus=focus.strip(),
-            target_job_id=task.id,
-            depends_on=[task.id],
+            target_job_id=worker.id,
+            depends_on=[worker.id],
             max_attempts=config.max_attempts,
         )
     claimed = claim_job(conn, review.id, f"kiln-reviewer-{os.getpid()}")
     if claimed is None:
         raise KilnError(f"job #{review.id} is not ready")
     review = start_execution(conn, claimed.id)
-    goal = require_goal(conn, task.goal_id)
+    goal = require_goal(conn, worker.goal_id)
     integration, _ = ensure_goal_branch(conn, config, goal)
-    worktree = Path(task.worktree_path) if task.worktree_path else config.worktrees_dir / str(task.id)
-    ensure_worktree(config.repo_root, worktree, task.branch, integration)
+    worktree = Path(worker.worktree_path) if worker.worktree_path else config.worktrees_dir / str(worker.id)
+    ensure_worktree(config.repo_root, worktree, worker.branch, integration)
 
     run = start_run(conn, role="reviewer", model=config.models.reviewer, job_id=review.id)
     if reporter:
-        reporter(f"reviewing job #{review.id} target #{task.id} with {config.models.reviewer}")
+        reporter(f"reviewing job #{review.id} target #{worker.id} with {config.models.reviewer}")
     log_path = config.runs_dir / f"{run.id}.log"
     prompt = render_prompt(
         "reviewer.md",
@@ -112,14 +112,14 @@ def run_reviewer(
             "goal_title": goal.title,
             "goal_description": goal.description or "(none)",
             "brief": goal.brief or "(none)",
-            "task_id": str(task.id),
-            "title": task.title,
-            "description": task.description or "(none)",
-            "acceptance": task.acceptance or "(none)",
+            "job_id": str(worker.id),
+            "title": worker.title,
+            "description": worker.description or "(none)",
+            "acceptance": worker.acceptance or "(none)",
             "focus": focus.strip() or "(none)",
-            "verify": _verify_text(conn, task.id),
+            "verify": _verify_text(conn, worker.id),
             "integration_branch": integration,
-            "diff": _capped_diff(config.repo_root, integration, task.branch),
+            "diff": _capped_diff(config.repo_root, integration, worker.branch),
         },
     )
     try:
@@ -166,7 +166,7 @@ def run_reviewer(
     stored = envelope(
         summary=report["summary"],
         evidence=list(report["findings"]),
-        artifacts=[{"type": "branch", "name": task.branch}],
+        artifacts=[{"type": "branch", "name": worker.branch}],
         role_result=report,
     )
     finished = finish_run(
@@ -204,8 +204,8 @@ def _capped_diff(repo: Path, base: str, branch: str) -> str:
     return text[:DIFF_CHAR_LIMIT] + f"\n\n[diff truncated, {omitted} characters omitted]"
 
 
-def _verify_text(conn: sqlite3.Connection, task_id: int) -> str:
-    run = latest_run(conn, task_id, "worker")
+def _verify_text(conn: sqlite3.Connection, job_id: int) -> str:
+    run = latest_run(conn, job_id, "worker")
     if run is None or not run.report_json:
         return "(none)"
     try:

@@ -201,19 +201,19 @@ def _snapshot(conn: sqlite3.Connection) -> tuple:
         (goal.id, goal.status.value, goal.branch, goal.pr_url, goal.brief, goal.evidence)
         for goal in list_goals(conn)
     )
-    tasks = tuple(
-        (task.id, task.status.value, task.integration.value if task.integration else "", task.attempts)
-        for task in list_jobs(conn)
+    jobs = tuple(
+        (job.id, job.status.value, job.integration.value if job.integration else "", job.attempts)
+        for job in list_jobs(conn)
     )
     notes = conn.execute("SELECT COUNT(*) AS n FROM notes").fetchone()["n"]
-    return (goals, tasks, notes)
+    return (goals, jobs, notes)
 
 
 def _stuck_message(conn: sqlite3.Connection) -> str:
-    open_tasks = [task for task in list_jobs(conn) if is_open(task)]
-    if not open_tasks:
+    open_jobs = [job for job in list_jobs(conn) if is_open(job)]
+    if not open_jobs:
         return "stopped: a turn made no progress"
-    detail = ", ".join(f"#{task.id} {task.status.value}" for task in open_tasks)
+    detail = ", ".join(f"#{job.id} {job.status.value}" for job in open_jobs)
     return f"stopped: a turn made no progress ({detail})"
 
 

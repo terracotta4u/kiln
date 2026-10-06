@@ -43,28 +43,28 @@ def run_worker(
     conn: sqlite3.Connection,
     config: Config,
     *,
-    task_id: int | None = None,
+    job_id: int | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     agent_bin: str | None = None,
     reporter: Callable[[str], None] | None = None,
 ) -> WorkerOutcome:
     worker = f"kiln-{os.getpid()}"
-    task = _claim(conn, task_id, worker)
-    branch = task.branch or branch_name(task.id, task.title)
-    worktree = Path(task.worktree_path) if task.worktree_path else config.worktrees_dir / str(task.id)
+    job = _claim(conn, job_id, worker)
+    branch = job.branch or branch_name(job.id, job.title)
+    worktree = Path(job.worktree_path) if job.worktree_path else config.worktrees_dir / str(job.id)
     try:
-        integration, _ = ensure_goal_branch(conn, config, require_goal(conn, task.goal_id))
+        integration, _ = ensure_goal_branch(conn, config, require_goal(conn, job.goal_id))
         ensure_worktree(config.repo_root, worktree, branch, integration)
     except KilnError:
-        release_claim(conn, task.id)
+        release_claim(conn, job.id)
         raise
 
-    task = start_attempt(conn, task.id, branch=branch, worktree_path=str(worktree.resolve()))
+    job = start_attempt(conn, job.id, branch=branch, worktree_path=str(worktree.resolve()))
     before = revision(worktree)
     if reporter:
-        reporter(f"working task #{task.id} on {branch}")
-    goal = require_goal(conn, task.goal_id)
-    run = start_run(conn, role="worker", model=config.models.worker, job_id=task.id)
+        reporter(f"working job #{job.id} on {branch}")
+    goal = require_goal(conn, job.goal_id)
+    run = start_run(conn, role="worker", model=config.models.worker, job_id=job.id)
     prompt = render_prompt(
         "worker.md",
         {
@@ -74,11 +74,11 @@ def run_worker(
             "base_branch": config.base_branch,
             "goal_id": str(goal.id),
             "goal_title": goal.title,
-            "task_id": str(task.id),
-            "title": task.title,
-            "description": task.description or "(none)",
-            "acceptance": task.acceptance or "(none)",
-            "feedback": task.feedback or "(none)",
+            "job_id": str(job.id),
+            "title": job.title,
+            "description": job.description or "(none)",
+            "acceptance": job.acceptance or "(none)",
+            "feedback": job.feedback or "(none)",
         },
     )
 
@@ -101,7 +101,7 @@ def run_worker(
         failure = str(exc)
 
     try:
-        committed = commit_if_dirty(worktree, f"kiln: task #{task.id} {task.title}")
+        committed = commit_if_dirty(worktree, f"kiln: job #{job.id} {job.title}")
     except KilnError as exc:
         failure = failure or str(exc)
 
@@ -126,9 +126,9 @@ def run_worker(
             log_path=str(config.runs_dir / f"{run.id}.log"),
             report=None,
         )
-        task = fail_job(conn, task.id, reason)
-        record_event(conn, "worker.failed", reason, job_id=task.id, run_id=finished.id)
-        return WorkerOutcome(job=task, run=finished, failure=reason, diffstat=changes, summary="")
+        job = fail_job(conn, job.id, reason)
+        record_event(conn, "worker.failed", reason, job_id=job.id, run_id=finished.id)
+        return WorkerOutcome(job=job, run=finished, failure=reason, diffstat=changes, summary="")
 
     if verify_code != 0:
         verify_failure = _verify_failure(verify_code, verify_out)
@@ -162,16 +162,16 @@ def run_worker(
         log_path=str(config.runs_dir / f"{run.id}.log"),
         report=stored,
     )
-    task = complete_job(conn, task.id, stored)
+    job = complete_job(conn, job.id, stored)
     record_event(
         conn,
         "worker.failed" if failure else "worker.completed",
-        failure or f"job #{task.id} completed",
-        job_id=task.id,
+        failure or f"job #{job.id} completed",
+        job_id=job.id,
         run_id=finished.id,
     )
     return WorkerOutcome(
-        job=task,
+        job=job,
         run=finished,
         failure=failure,
         diffstat=changes,
@@ -179,17 +179,17 @@ def run_worker(
     )
 
 
-def _claim(conn: sqlite3.Connection, task_id: int | None, worker: str) -> Job:
-    if task_id is not None:
-        task = require_job(conn, task_id)
-        if task.role != JobRole.worker:
-            raise KilnError(f"job #{task.id} is a {task.role.value}; only a worker job can be claimed here")
-        if task.status == JobStatus.pending and task.attempts >= task.max_attempts:
-            fail_job(conn, task.id, f"exhausted {task.max_attempts} attempts")
-            raise KilnError(f"task #{task.id} exhausted {task.max_attempts} attempts")
-        claimed = claim_job(conn, task.id, worker)
+def _claim(conn: sqlite3.Connection, job_id: int | None, worker: str) -> Job:
+    if job_id is not None:
+        job = require_job(conn, job_id)
+        if job.role != JobRole.worker:
+            raise KilnError(f"job #{job.id} is a {job.role.value}; only a worker job can be claimed here")
+        if job.status == JobStatus.pending and job.attempts >= job.max_attempts:
+            fail_job(conn, job.id, f"exhausted {job.max_attempts} attempts")
+            raise KilnError(f"job #{job.id} exhausted {job.max_attempts} attempts")
+        claimed = claim_job(conn, job.id, worker)
         if claimed is None:
-            raise KilnError(f"task #{task.id} is not ready")
+            raise KilnError(f"job #{job.id} is not ready")
         return claimed
 
     while True:
@@ -200,7 +200,7 @@ def _claim(conn: sqlite3.Connection, task_id: int | None, worker: str) -> Job:
         if candidate.attempts >= candidate.max_attempts:
             fail_job(conn, candidate.id, f"exhausted {candidate.max_attempts} attempts")
             if len(ready) == 1:
-                raise KilnError(f"task #{candidate.id} exhausted {candidate.max_attempts} attempts")
+                raise KilnError(f"job #{candidate.id} exhausted {candidate.max_attempts} attempts")
             continue
         claimed = claim_job(conn, candidate.id, worker)
         if claimed is not None:

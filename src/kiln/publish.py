@@ -38,7 +38,7 @@ def publish_ready_goals(
     gh_bin: str = "gh",
     remote: str = "origin",
 ) -> list[str]:
-    """Open one pull request for each goal whose tasks are all finished."""
+    """Open one pull request for each goal whose jobs are all finished."""
     lines: list[str] = []
     for goal in _goals_ready_to_publish(conn):
         lines.append(_publish_goal(conn, config, goal, gh_bin=gh_bin, remote=remote))
@@ -50,10 +50,10 @@ def _goals_ready_to_publish(conn: sqlite3.Connection) -> list[Goal]:
     for goal in list_goals_all(conn):
         if goal.pr_url is not None:
             continue
-        tasks = list_jobs(conn, goal_id=goal.id)
-        if any(is_open(task) for task in tasks):
+        jobs = list_jobs(conn, goal_id=goal.id)
+        if any(is_open(job) for job in jobs):
             continue
-        if not tasks and goal.status != GoalStatus.done:
+        if not jobs and goal.status != GoalStatus.done:
             continue
         ready.append(goal)
     return ready
@@ -153,8 +153,8 @@ def _pull_request_body(conn: sqlite3.Connection, goal: Goal) -> str:
     else:
         lines.append("(none)")
     lines.extend(["", "Jobs:"])
-    for task in list_jobs(conn, goal_id=goal.id):
-        lines.append(f"- #{task.id} {task.role.value} [{task.status.value}] {task.title}")
+    for job in list_jobs(conn, goal_id=goal.id):
+        lines.append(f"- #{job.id} {job.role.value} [{job.status.value}] {job.title}")
     return "\n".join(lines).strip() + "\n"
 
 

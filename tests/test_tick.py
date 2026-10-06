@@ -13,7 +13,7 @@ from kiln.db import connect
 from kiln.jobs import add_goal, add_job, dependencies, get_job, list_jobs, require_goal
 from kiln.models import GoalStatus, Integration, JobRole, JobStatus
 from kiln.notes import list_notes
-from kiln.review import approve_task
+from kiln.review import approve_job
 from kiln.roles.foreman import apply_actions
 from kiln.roles.worker import run_worker
 from kiln.tick import run_tick, run_until_done
@@ -41,20 +41,20 @@ def test_turns_dispatch_review_then_finish(factory: Path):
     try:
         add_goal(conn, "Ship it", "Add a marker file")
         first = run_tick(conn, config, agent_bin=str(script))
-        task = list_jobs(conn)[0]
+        job = list_jobs(conn)[0]
         on_main_after_work = (factory / "marker.txt").exists()
         second = run_tick(conn, config, agent_bin=str(script))
-        reviewed = get_job(conn, task.id)
+        reviewed = get_job(conn, job.id)
         third = run_tick(conn, config, agent_bin=str(script))
-        stored = get_job(conn, task.id)
+        stored = get_job(conn, job.id)
         goal = require_goal(conn, 1)
     finally:
         conn.close()
 
     assert any("created job #1" in line for line in first.lines)
     assert any("job #1  completed" in line for line in first.lines)
-    assert task.status == JobStatus.completed
-    assert task.integration == Integration.pending
+    assert job.status == JobStatus.completed
+    assert job.integration == Integration.pending
     assert on_main_after_work is False
     assert reviewed is not None and reviewed.status == JobStatus.completed
     assert reviewed.integration == Integration.pending
@@ -83,7 +83,7 @@ def test_turns_dispatch_review_then_finish(factory: Path):
     assert goal.evidence == ("marker.txt is ok on the goal branch",)
 
 
-def test_conflict_sends_the_task_back_for_rework(factory: Path):
+def test_conflict_sends_the_job_back_for_rework(factory: Path):
     script = _agent(
         factory,
         "from pathlib import Path\n"
@@ -94,15 +94,15 @@ def test_conflict_sends_the_task_back_for_rework(factory: Path):
     conn = connect(config.db_path)
     try:
         goal = add_goal(conn, "Ship it")
-        task = add_job(conn, goal.id, "Edit readme")
-        run_worker(conn, config, task_id=task.id, agent_bin=str(script))
+        job = add_job(conn, goal.id, "Edit readme")
+        run_worker(conn, config, job_id=job.id, agent_bin=str(script))
         integration = require_goal(conn, goal.id).branch
         subprocess.run(["git", "checkout", integration], cwd=factory, check=True, capture_output=True)
         (factory / "README.md").write_text("goal\n")
         subprocess.run(["git", "commit", "-am", "goal edit"], cwd=factory, check=True, capture_output=True)
         subprocess.run(["git", "checkout", "main"], cwd=factory, check=True, capture_output=True)
-        message = approve_task(conn, config, task.id)
-        stored = get_job(conn, task.id)
+        message = approve_job(conn, config, job.id)
+        stored = get_job(conn, job.id)
     finally:
         conn.close()
 
@@ -155,18 +155,18 @@ def test_dry_run_changes_nothing(factory: Path):
     try:
         add_goal(conn, "Ship it", "A factory")
         result = run_tick(conn, config, agent_bin=str(script), dry_run=True)
-        tasks = list_jobs(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
     assert not (factory / "agent-ran").exists()
-    assert tasks == []
+    assert jobs == []
     assert any("Ship it" in line for line in result.lines)
     assert any("Turn 1 of 25" in line for line in result.lines)
     assert any("would create branch" in line for line in result.lines)
 
 
-def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
+def test_worker_limit_dispatches_one_of_two_ready_jobs(factory: Path):
     script = _agent(factory, _smart_agent())
     config = load_config(factory)
     conn = connect(config.db_path)
@@ -175,11 +175,11 @@ def test_worker_limit_dispatches_one_of_two_ready_tasks(factory: Path):
         add_job(conn, goal.id, "First")
         add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=1, agent_bin=str(script))
-        tasks = list_jobs(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
-    statuses = sorted(task.status for task in tasks)
+    statuses = sorted(job.status for job in jobs)
     assert statuses == [JobStatus.completed, JobStatus.pending]
 
 
@@ -192,11 +192,11 @@ def test_two_workers_run_together(factory: Path):
         add_job(conn, goal.id, "First")
         add_job(conn, goal.id, "Second")
         run_tick(conn, config, workers=2, agent_bin=str(script))
-        tasks = list_jobs(conn)
+        jobs = list_jobs(conn)
     finally:
         conn.close()
 
-    assert [task.status for task in tasks] == [JobStatus.completed, JobStatus.completed]
+    assert [job.status for job in jobs] == [JobStatus.completed, JobStatus.completed]
 
 
 def test_run_until_done_opens_one_pull_request(factory: Path):

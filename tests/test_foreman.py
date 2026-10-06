@@ -41,11 +41,11 @@ def test_apply_creates_a_dependency_chain(tmp_path):
             },
         ],
     )
-    tasks = list_jobs(conn, goal_id=goal.id)
-    assert [task.title for task in tasks] == ["Schema", "CLI"]
-    assert tasks[0].priority == 2
+    jobs = list_jobs(conn, goal_id=goal.id)
+    assert [job.title for job in jobs] == ["Schema", "CLI"]
+    assert jobs[0].priority == 2
     assert "depending on #1" in messages[1]
-    ready = [task.title for task in tasks if task.status == JobStatus.pending]
+    ready = [job.title for job in jobs if job.status == JobStatus.pending]
     assert ready == ["Schema", "CLI"]
     conn.close()
 
@@ -53,7 +53,7 @@ def test_apply_creates_a_dependency_chain(tmp_path):
 def test_apply_notes_brief_and_goal_done(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
-    task = add_job(conn, goal.id, "Schema")
+    job = add_job(conn, goal.id, "Schema")
     messages = apply_actions(
         conn,
         _config(),
@@ -61,13 +61,13 @@ def test_apply_notes_brief_and_goal_done(tmp_path):
         [
             {"type": "note", "text": "looked around"},
             {"type": "update_brief", "text": "Success: the schema exists."},
-            {"type": "cancel", "job_id": task.id},
+            {"type": "cancel", "job_id": job.id},
             {"type": "goal_done"},
             {"type": "goal_done", "evidence": ["schema task was cancelled"]},
             {"type": "frobnicate"},
         ],
     )
-    stored = get_job(conn, task.id)
+    stored = get_job(conn, job.id)
     finished = require_goal(conn, goal.id)
     assert any(message.startswith("note #") for message in messages)
     assert stored is not None and stored.status == JobStatus.cancelled
@@ -79,7 +79,7 @@ def test_apply_notes_brief_and_goal_done(tmp_path):
     conn.close()
 
 
-def test_goal_done_waits_for_open_tasks(tmp_path):
+def test_goal_done_waits_for_open_jobs(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
     add_job(conn, goal.id, "Schema")
@@ -95,7 +95,7 @@ def test_goal_done_waits_for_open_tasks(tmp_path):
     conn.close()
 
 
-def test_dispatch_respects_the_limit_and_blocked_tasks(tmp_path):
+def test_dispatch_respects_the_limit_and_blocked_jobs(tmp_path):
     conn = _db(tmp_path)
     goal = add_goal(conn, "Ship it")
     first = add_job(conn, goal.id, "Schema")
@@ -303,12 +303,12 @@ def test_actions_cannot_touch_another_goal(tmp_path):
     conn = _db(tmp_path)
     first = add_goal(conn, "One")
     second = add_goal(conn, "Two")
-    task = add_job(conn, second.id, "Elsewhere")
-    set_job_status(conn, task.id, JobStatus.completed)
-    set_integration(conn, task.id, Integration.pending)
-    messages = apply_actions(conn, _config(), first, [{"type": "reject", "job_id": task.id, "reason": "no"}])
+    job = add_job(conn, second.id, "Elsewhere")
+    set_job_status(conn, job.id, JobStatus.completed)
+    set_integration(conn, job.id, Integration.pending)
+    messages = apply_actions(conn, _config(), first, [{"type": "reject", "job_id": job.id, "reason": "no"}])
     assert "not in goal" in messages[0]
-    stored = get_job(conn, task.id)
+    stored = get_job(conn, job.id)
     assert stored is not None and stored.status == JobStatus.completed
     assert stored.integration == Integration.pending
     conn.close()

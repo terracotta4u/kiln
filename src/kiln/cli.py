@@ -26,7 +26,7 @@ from kiln.jobs import (
     require_job,
 )
 from kiln.models import Event, Goal, Job, JobStatus, Run
-from kiln.review import approve_task, reject_task, send_back
+from kiln.review import approve_job, reject_job, send_back
 from kiln.roles.scout import run_scout
 from kiln.roles.worker import run_worker
 from kiln.runs import require_run
@@ -105,7 +105,7 @@ def work(
     """Claim one ready worker and run it in its own worktree."""
 
     def render(config: Config, conn) -> None:
-        outcome = run_worker(conn, config, task_id=job, reporter=typer.echo)
+        outcome = run_worker(conn, config, job_id=job, reporter=typer.echo)
         typer.echo(
             f"job #{outcome.job.id}  {outcome.job.status.value}  {outcome.job.branch}"
         )
@@ -184,11 +184,11 @@ def review(
 
     def render(config: Config, conn) -> None:
         if approve:
-            typer.echo(approve_task(conn, config, job_id))
+            typer.echo(approve_job(conn, config, job_id))
         elif rework is not None:
             typer.echo(send_back(conn, job_id, rework))
         else:
-            typer.echo(reject_task(conn, job_id, reason))
+            typer.echo(reject_job(conn, job_id, reason))
 
     _with_db(render)
 
@@ -214,7 +214,7 @@ def log(
 
 @app.command()
 def gc() -> None:
-    """Remove worktrees and merged branches left behind by finished tasks."""
+    """Remove worktrees and merged branches left behind by finished jobs."""
 
     def render(config: Config, conn) -> None:
         lines = cleanup(conn, config)
@@ -237,7 +237,7 @@ def runs_show(run_id: int = typer.Argument(help="Run id.")) -> None:
         typer.echo(f"role        {run.role}")
         typer.echo(f"model       {run.model}")
         typer.echo(f"status      {run.status.value}")
-        typer.echo(f"task        {_format_task_ref(run)}")
+        typer.echo(f"job         {_format_job_ref(run)}")
         typer.echo(f"exit        {_format_exit(run.exit_code)}")
         typer.echo(f"started     {run.started_at}")
         typer.echo(f"finished    {run.finished_at or '(still running)'}")
@@ -260,12 +260,12 @@ def status() -> None:
         if not goals:
             typer.echo("no goals")
             return
-        tasks = list_jobs(conn)
+        jobs = list_jobs(conn)
         by_goal: dict[int, list[Job]] = {goal.id: [] for goal in goals}
-        for task in tasks:
-            by_goal.setdefault(task.goal_id, []).append(task)
+        for job in jobs:
+            by_goal.setdefault(job.goal_id, []).append(job)
         for goal in goals:
-            counts = Counter(task.status for task in by_goal.get(goal.id, []))
+            counts = Counter(job.status for job in by_goal.get(goal.id, []))
             summary = ", ".join(
                 f"{counts[state]} {state.value}" for state in JobStatus if counts[state]
             )
@@ -273,27 +273,27 @@ def status() -> None:
             typer.echo(f"    {summary or 'no jobs'}")
 
         ready = ready_jobs(conn)
-        ready_ids = {task.id for task in ready}
+        ready_ids = {job.id for job in ready}
         typer.echo("\nready")
-        _echo_task_lines(ready)
+        _echo_job_lines(ready)
 
         blocked = [
-            task for task in tasks if task.status == JobStatus.pending and task.id not in ready_ids
+            job for job in jobs if job.status == JobStatus.pending and job.id not in ready_ids
         ]
         if blocked:
             typer.echo("\nblocked")
-            for task in blocked:
-                deps = ", ".join(f"#{dep.id}" for dep in dependencies(conn, task.id))
-                typer.echo(f"  #{task.id}  p{task.priority}  {task.title}  deps: {deps}")
+            for job in blocked:
+                deps = ", ".join(f"#{dep.id}" for dep in dependencies(conn, job.id))
+                typer.echo(f"  #{job.id}  p{job.priority}  {job.title}  deps: {deps}")
 
         inflight = [
-            task
-            for task in tasks
-            if is_open(task) and task.status != JobStatus.pending
+            job
+            for job in jobs
+            if is_open(job) and job.status != JobStatus.pending
         ]
         if inflight:
             typer.echo("\nin progress")
-            _echo_task_lines(inflight)
+            _echo_job_lines(inflight)
 
     _with_db(render)
 
@@ -334,9 +334,9 @@ def goal_show(goal_id: int = typer.Argument(help="Goal id.")) -> None:
     def render(_config: Config, conn) -> None:
         goal = require_goal(conn, goal_id)
         _echo_goal(goal)
-        tasks = list_jobs(conn, goal_id=goal.id)
+        jobs = list_jobs(conn, goal_id=goal.id)
         typer.echo("\njobs")
-        _echo_task_lines(tasks)
+        _echo_job_lines(jobs)
 
     _with_db(render)
 
@@ -357,7 +357,7 @@ def job_add(
     """Add a worker job to a goal."""
 
     def render(config: Config, conn) -> None:
-        task = add_job(
+        job = add_job(
             conn,
             goal_id,
             title,
@@ -367,8 +367,8 @@ def job_add(
             max_attempts=config.max_attempts,
         )
         for dep_id in depends_on or []:
-            add_dependency(conn, task.id, dep_id)
-        typer.echo(f"job #{task.id}  {task.title}")
+            add_dependency(conn, job.id, dep_id)
+        typer.echo(f"job #{job.id}  {job.title}")
 
     _with_db(render)
 
@@ -381,17 +381,17 @@ def job_list(
     """List jobs."""
 
     def render(_config: Config, conn) -> None:
-        tasks = list_jobs(conn, goal_id=goal_id, status=status)
-        if not tasks:
+        jobs = list_jobs(conn, goal_id=goal_id, status=status)
+        if not jobs:
             typer.echo("no jobs")
             return
-        for task in tasks:
-            deps = dependencies(conn, task.id)
+        for job in jobs:
+            deps = dependencies(conn, job.id)
             suffix = ""
             if deps:
                 suffix = "  deps: " + ", ".join(f"#{dep.id}" for dep in deps)
             typer.echo(
-                f"#{task.id}  {task.status.value:<9}  {task.role.value:<8}  p{task.priority}  {task.title}{suffix}"
+                f"#{job.id}  {job.status.value:<9}  {job.role.value:<8}  p{job.priority}  {job.title}{suffix}"
             )
 
     _with_db(render)
@@ -402,33 +402,33 @@ def job_show(job_id: int = typer.Argument(help="Job id.")) -> None:
     """Show a job, its dependencies, and anything it blocks."""
 
     def render(_config: Config, conn) -> None:
-        task = require_job(conn, job_id)
-        goal = require_goal(conn, task.goal_id)
-        typer.echo(f"job #{task.id}")
-        typer.echo(f"role        {task.role.value}")
-        typer.echo(f"status      {task.status.value}")
-        if task.integration:
-            typer.echo(f"integration {task.integration.value}")
-        if task.target_job_id is not None:
-            typer.echo(f"target      #{task.target_job_id}")
+        job = require_job(conn, job_id)
+        goal = require_goal(conn, job.goal_id)
+        typer.echo(f"job #{job.id}")
+        typer.echo(f"role        {job.role.value}")
+        typer.echo(f"status      {job.status.value}")
+        if job.integration:
+            typer.echo(f"integration {job.integration.value}")
+        if job.target_job_id is not None:
+            typer.echo(f"target      #{job.target_job_id}")
         typer.echo(f"goal        #{goal.id}  {goal.title}")
-        typer.echo(f"title       {task.title}")
-        typer.echo(f"priority    {task.priority}")
-        typer.echo(f"attempts    {task.attempts}/{task.max_attempts}")
-        if task.claimed_by:
-            typer.echo(f"claimed by  {task.claimed_by}")
-        if task.branch:
-            typer.echo(f"branch      {task.branch}")
-        if task.worktree_path:
-            typer.echo(f"worktree    {task.worktree_path}")
-        if task.feedback:
-            typer.echo(f"feedback    {task.feedback}")
-        typer.echo("depends on  " + _format_related(dependencies(conn, task.id)))
-        typer.echo("blocks      " + _format_related(dependents(conn, task.id)))
+        typer.echo(f"title       {job.title}")
+        typer.echo(f"priority    {job.priority}")
+        typer.echo(f"attempts    {job.attempts}/{job.max_attempts}")
+        if job.claimed_by:
+            typer.echo(f"claimed by  {job.claimed_by}")
+        if job.branch:
+            typer.echo(f"branch      {job.branch}")
+        if job.worktree_path:
+            typer.echo(f"worktree    {job.worktree_path}")
+        if job.feedback:
+            typer.echo(f"feedback    {job.feedback}")
+        typer.echo("depends on  " + _format_related(dependencies(conn, job.id)))
+        typer.echo("blocks      " + _format_related(dependents(conn, job.id)))
         typer.echo("\ndescription")
-        typer.echo(task.description or "(none)")
+        typer.echo(job.description or "(none)")
         typer.echo("\nacceptance")
-        typer.echo(task.acceptance or "(none)")
+        typer.echo(job.acceptance or "(none)")
 
     _with_db(render)
 
@@ -452,8 +452,8 @@ def job_cancel(job_id: int = typer.Argument(help="Job id.")) -> None:
     """Cancel a job that is not already finished."""
 
     def render(_config: Config, conn) -> None:
-        task = cancel_job(conn, job_id)
-        typer.echo(f"cancelled #{task.id}  {task.title}")
+        job = cancel_job(conn, job_id)
+        typer.echo(f"cancelled #{job.id}  {job.title}")
 
     _with_db(render)
 
@@ -499,12 +499,12 @@ def _echo_goal(goal: Goal) -> None:
             typer.echo(f"- {item}")
 
 
-def _echo_task_lines(tasks: list[Job]) -> None:
-    if not tasks:
+def _echo_job_lines(jobs: list[Job]) -> None:
+    if not jobs:
         typer.echo("  (none)")
         return
-    for task in tasks:
-        typer.echo(f"  #{task.id}  {task.status.value:<9}  p{task.priority}  {task.title}")
+    for job in jobs:
+        typer.echo(f"  #{job.id}  {job.status.value:<9}  p{job.priority}  {job.title}")
 
 
 def _format_event(event: Event) -> str:
@@ -520,7 +520,7 @@ def _format_event(event: Event) -> str:
     return f"{prefix}  {message}"
 
 
-def _format_task_ref(run: Run) -> str:
+def _format_job_ref(run: Run) -> str:
     if run.job_id is None:
         return "(none)"
     return f"#{run.job_id}"
@@ -556,10 +556,10 @@ def _read_log_tail(log_path: str | None, *, lines: int = 40) -> str:
     return f"... {omitted} earlier lines\n" + "\n".join(parts[-lines:])
 
 
-def _format_related(tasks: list[Job]) -> str:
-    if not tasks:
+def _format_related(jobs: list[Job]) -> str:
+    if not jobs:
         return "(none)"
-    return ", ".join(f"#{task.id} {task.title} [{task.status.value}]" for task in tasks)
+    return ", ".join(f"#{job.id} {job.title} [{job.status.value}]" for job in jobs)
 
 
 def main() -> None:
