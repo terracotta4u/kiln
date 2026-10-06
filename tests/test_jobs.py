@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from kiln.db import connect, migrate
+from kiln.db import connect, events_after, last_event_id, migrate, record_event
 from kiln.errors import KilnError
 from kiln.jobs import (
     add_dependency,
@@ -31,6 +31,19 @@ def conn(tmp_path):
     migrate(connection)
     yield connection
     connection.close()
+
+
+def test_events_after_walks_forward_from_a_cursor(conn):
+    assert last_event_id(conn) == 0
+    record_event(conn, "goal.created", "one")
+    first = last_event_id(conn)
+    record_event(conn, "goal.created", "two")
+    record_event(conn, "job.created", "three")
+
+    page = events_after(conn, first, limit=10)
+    assert [event.message for event in page] == ["two", "three"]
+    assert page[0].id > first
+    assert events_after(conn, page[-1].id, limit=10) == []
 
 
 def test_migrate_is_idempotent(conn):

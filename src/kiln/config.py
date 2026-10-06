@@ -184,7 +184,7 @@ max_parallel_workers = {DEFAULT_MAX_PARALLEL_WORKERS}
 # Rework attempts before another attempt is refused.
 max_attempts = {DEFAULT_MAX_ATTEMPTS}
 
-# Foreman turns one `kiln run` may take before it stops.
+# Foreman turns one factory run may take before it stops.
 max_foreman_turns = {DEFAULT_MAX_FOREMAN_TURNS}
 
 # Delete a job branch after it merges into the goal branch.

@@ -123,6 +123,24 @@ def list_events(conn: sqlite3.Connection, *, limit: int) -> list[Event]:
     return [Event.from_row(row) for row in reversed(rows)]
 
 
+def last_event_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(id) AS id FROM events").fetchone()
+    if row is None or row["id"] is None:
+        return 0
+    return int(row["id"])
+
+
+def events_after(conn: sqlite3.Connection, after_id: int, *, limit: int) -> list[Event]:
+    """Events with id greater than after_id, oldest first. Suitable as a cursor."""
+    if limit < 1:
+        raise KilnError("log limit must be >= 1")
+    rows = conn.execute(
+        "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
+        (after_id, limit),
+    ).fetchall()
+    return [Event.from_row(row) for row in rows]
+
+
 def record_event(
     conn: sqlite3.Connection,
     kind: str,

@@ -1,11 +1,21 @@
 import json
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from kiln.agent import build_command, parse_agent_output, run_agent
+from kiln.agent import (
+    _LIVE_LOCK,
+    build_command,
+    kill_live_agents,
+    parse_agent_output,
+    run_agent,
+    shutdown_agents,
+)
+import kiln.agent as agent_module
 from kiln.errors import KilnError
 from kiln.prompts import render_prompt
 
@@ -110,6 +120,79 @@ def test_run_agent_times_out(tmp_path: Path):
     )
     assert result.timed_out is True
     assert "timed out" in result.log_path.read_text()
+
+
+def test_kill_live_agents_stops_a_running_agent(tmp_path: Path):
+    script = _fake_agent(tmp_path, "import time\ntime.sleep(30)\n")
+    log_path = tmp_path / "run.log"
+    holder: dict[str, object] = {}
+
+    def go() -> None:
+        holder["result"] = run_agent(
+            prompt="wait",
+            model="composer-2.5",
+            workspace=tmp_path,
+            log_path=log_path,
+            timeout=30,
+            agent_bin=str(script),
+        )
+
+    thread = threading.Thread(target=go)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not log_path.exists():
+        time.sleep(0.02)
+    assert log_path.exists()
+    kill_live_agents()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    result = holder["result"]
+    assert result.timed_out is False
+    assert result.exit_code != 0
+
+
+def test_shutdown_agents_kills_what_is_running_and_refuses_the_next_spawn(tmp_path: Path):
+    script = _fake_agent(tmp_path, "import time\ntime.sleep(30)\n")
+    log_path = tmp_path / "run.log"
+    holder: dict[str, object] = {}
+
+    def go() -> None:
+        holder["result"] = run_agent(
+            prompt="wait",
+            model="composer-2.5",
+            workspace=tmp_path,
+            log_path=log_path,
+            timeout=30,
+            agent_bin=str(script),
+        )
+
+    thread = threading.Thread(target=go)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not log_path.exists():
+        time.sleep(0.02)
+    assert log_path.exists()
+    try:
+        shutdown_agents()
+        thread.join(5)
+        assert not thread.is_alive()
+        result = holder["result"]
+        assert result.timed_out is False
+        assert result.exit_code != 0
+        with pytest.raises(KilnError, match="shutting down"):
+            run_agent(
+                prompt="wait",
+                model="composer-2.5",
+                workspace=tmp_path,
+                log_path=tmp_path / "next.log",
+                timeout=2,
+                agent_bin=str(script),
+            )
+        assert not (tmp_path / "next.log").exists()
+    finally:
+        with _LIVE_LOCK:
+            agent_module._SHUTTING_DOWN = False
 
 
 def test_missing_agent_is_an_error(tmp_path: Path):

@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -8,8 +10,10 @@ import typer
 
 from kiln import __version__
 from kiln.config import Config, init_factory, load_config
-from kiln.db import connect, list_events, migrate
+from kiln.db import connect, events_after, list_events, migrate
 from kiln.errors import KilnError
+from kiln.server.client import Client, ensure_running, is_running, start_detached
+from kiln.server.server import serve
 from kiln.gc import cleanup
 from kiln.jobs import (
     add_dependency,
@@ -36,9 +40,11 @@ app = typer.Typer(no_args_is_help=True, help="Kiln: an automated software factor
 goal_app = typer.Typer(no_args_is_help=True, help="Manage goals.")
 job_app = typer.Typer(no_args_is_help=True, help="Manage jobs.")
 runs_app = typer.Typer(no_args_is_help=True, help="Inspect agent runs.")
+server_app = typer.Typer(no_args_is_help=True, help="The server that owns running factories.")
 app.add_typer(goal_app, name="goal")
 app.add_typer(job_app, name="job")
 app.add_typer(runs_app, name="runs")
+app.add_typer(server_app, name="server")
 
 
 def _version(value: bool) -> None:
@@ -74,6 +80,68 @@ def init() -> None:
     typer.echo(f"database {config.db_path}")
 
 
+@server_app.command("start")
+def server_start() -> None:
+    """Start the Kiln server in the background. Harmless if it is already running."""
+    try:
+        if is_running():
+            info = Client().ping()
+            typer.echo(f"kiln server already running (pid {info['pid']})")
+            return
+        info = start_detached()
+    except KilnError as exc:
+        _fail(exc)
+    typer.echo(f"kiln server started (pid {info['pid']})")
+
+
+@server_app.command("status")
+def server_status() -> None:
+    """Report whether the Kiln server is running."""
+    if not is_running():
+        typer.echo("not running")
+        return
+    try:
+        info = Client().server_status()
+    except KilnError as exc:
+        _fail(exc)
+    count = sum(1 for factory in info["factories"] if factory["state"] == "running")
+    noun = "factory" if count == 1 else "factories"
+    typer.echo(f"running (pid {info['pid']}, {count} {noun})")
+
+
+@server_app.command("stop")
+def server_stop(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Stop running factories and kill their agents, then exit.",
+    ),
+) -> None:
+    """Stop the Kiln server. Refuses while a factory is running unless --force."""
+    if not is_running():
+        typer.echo("not running")
+        return
+    try:
+        Client().stop_server(force=force)
+    except KilnError as exc:
+        _fail(exc)
+    deadline = time.monotonic() + 20
+    while is_running() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if is_running():
+        _fail(KilnError("kiln server did not exit"))
+    typer.echo("kiln server stopped")
+
+
+@server_app.command("serve", hidden=True)
+def server_serve() -> None:
+    """Run the server in the foreground. `kiln server start` launches this."""
+    try:
+        serve()
+    except KilnError as exc:
+        _fail(exc)
+
+
 @app.command()
 def scout(
     question: str = typer.Argument(help="What the scout should find out."),
@@ -90,7 +158,7 @@ def scout(
         typer.echo(f"\njob #{outcome.job.id}  {outcome.job.status.value}")
         typer.echo(outcome.summary)
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @app.command()
@@ -121,7 +189,7 @@ def work(
         if outcome.failure:
             raise KilnError(f"job #{outcome.job.id} completed with a problem: {outcome.failure}")
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @app.command()
@@ -143,12 +211,14 @@ def run(
         help="Print the state the foreman would see and change nothing.",
     ),
 ) -> None:
-    """Run until every active goal is finished, then open a pull request."""
+    """Ask the Kiln server to run this repository's factory, and follow its events.
 
-    def render(config: Config, conn) -> None:
-        if turns is not None and turns < 1:
-            raise KilnError("turns must be >= 1")
-        if dry_run:
+    Closing this command detaches. The factory keeps running. Reconnect with `kiln attach`.
+    """
+    if dry_run:
+        def render(config: Config, conn) -> None:
+            if turns is not None and turns < 1:
+                raise KilnError("turns must be >= 1")
             outcome = run_tick(
                 conn,
                 config,
@@ -159,10 +229,65 @@ def run(
             )
             for line in outcome.lines:
                 typer.echo(line)
-            return
-        run_until_done(conn, config, workers=workers, turns=turns, reporter=typer.echo)
 
-    _with_db(render)
+        _with_db(render)
+        return
+    if turns is not None and turns < 1:
+        _fail(KilnError("turns must be >= 1"))
+    try:
+        config = load_config()
+        client = ensure_running()
+        _warn_version(client.ping())
+        started = client.start_factory(
+            config.repo_root,
+            workers=workers,
+            turns=turns,
+            agent_bin=os.environ.get("KILN_AGENT_BIN"),
+        )
+        if not started["started"]:
+            typer.echo(
+                f"factory already running for {config.repo_root} "
+                f"since {started['factory']['started_at']}; attaching"
+            )
+        _follow(client, config.repo_root, int(started["cursor"]))
+    except KeyboardInterrupt:
+        typer.echo("detached; the factory keeps running. Reconnect with `kiln attach`.")
+    except KilnError as exc:
+        _fail(exc)
+
+
+@app.command()
+def attach(
+    since: int | None = typer.Option(
+        None,
+        "--since",
+        help="Print events after this id, then follow new ones.",
+    ),
+) -> None:
+    """Show this repository's factory and follow its events. Detach leaves the factory running."""
+    try:
+        config = load_config()
+    except KilnError as exc:
+        _fail(exc)
+    if not is_running():
+        _fail(KilnError("kiln server is not running; start it with `kiln server start`"))
+    client = Client()
+    try:
+        _warn_version(client.ping())
+        info = client.factory_status(config.repo_root)
+        cursor = _print_factory_view(config, info, since)
+    except KilnError as exc:
+        _fail(exc)
+    if info["factory"]["state"] != "running":
+        _echo_outcome(info["factory"])
+        typer.echo("no factory running for this repository; use `kiln run`")
+        return
+    try:
+        _follow(client, config.repo_root, cursor)
+    except KeyboardInterrupt:
+        typer.echo("detached; the factory keeps running. Reconnect with `kiln attach`.")
+    except KilnError as exc:
+        _fail(exc)
 
 
 @app.command()
@@ -190,7 +315,7 @@ def review(
         else:
             typer.echo(reject_job(conn, job_id, reason))
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @app.command()
@@ -224,7 +349,7 @@ def gc() -> None:
         for line in lines:
             typer.echo(line)
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @runs_app.command("show")
@@ -255,6 +380,7 @@ def status() -> None:
     """Show goals, ready work, and jobs in progress."""
 
     def render(config: Config, conn) -> None:
+        typer.echo(_server_line(config.repo_root))
         typer.echo(f"repo  {config.repo_root}")
         goals = list_goals(conn)
         if not goals:
@@ -305,9 +431,10 @@ def goal_add(
 ) -> None:
     """Add a goal."""
 
-    def render(_config: Config, conn) -> None:
+    def render(config: Config, conn) -> None:
         goal = add_goal(conn, title, description)
         typer.echo(f"goal #{goal.id}  {goal.title}")
+        _hand_goal_to_running_server(config)
 
     _with_db(render)
 
@@ -369,7 +496,7 @@ def job_add(
         )
         typer.echo(f"job #{job.id}  {job.title}")
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @job_app.command("list")
@@ -443,7 +570,7 @@ def job_dep(
         add_dependency(conn, job_id, depends_on)
         typer.echo(f"job #{job_id} depends on #{depends_on}")
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
 @job_app.command("cancel")
@@ -454,14 +581,19 @@ def job_cancel(job_id: int = typer.Argument(help="Job id.")) -> None:
         job = cancel_job(conn, job_id)
         typer.echo(f"cancelled #{job.id}  {job.title}")
 
-    _with_db(render)
+    _with_db(render, mutates_lifecycle=True)
 
 
-def _with_db(fn: Callable) -> None:
+def _with_db(fn: Callable, *, mutates_lifecycle: bool = False) -> None:
     try:
         config = load_config()
     except KilnError as exc:
         _fail(exc)
+    if mutates_lifecycle:
+        try:
+            _refuse_if_factory_running(config)
+        except KilnError as exc:
+            _fail(exc)
     conn = connect(config.db_path)
     try:
         migrate(conn)
@@ -470,6 +602,154 @@ def _with_db(fn: Callable) -> None:
         _fail(exc)
     finally:
         conn.close()
+
+
+def _hand_goal_to_running_server(config: Config) -> None:
+    """If the server is up, ask it to include this goal in the factory.
+
+    A running factory takes another pass before it marks itself completed. If the
+    previous run has already finished, this starts the next one. A server that is
+    not running is left alone; `kiln run` picks the goal up later.
+    """
+    if not is_running():
+        return
+    try:
+        Client().start_factory(config.repo_root, agent_bin=os.environ.get("KILN_AGENT_BIN"))
+    except KilnError:
+        return
+
+
+def _refuse_if_factory_running(config: Config) -> None:
+    """The server owns job lifecycle while it is running a factory for this repo."""
+    if not is_running():
+        return
+    try:
+        info = Client().factory_status(config.repo_root)
+    except KilnError:
+        return
+    factory = info["factory"]
+    if factory["state"] != "running":
+        return
+    raise KilnError(
+        "a factory is running for this repository "
+        f"(since {factory['started_at']}); the server owns job lifecycle while it runs. "
+        "Watch it with `kiln attach`, wait for it to finish, or `kiln server stop --force`."
+    )
+
+
+def _warn_version(info: dict) -> None:
+    remote = info.get("version")
+    if remote and remote != __version__:
+        typer.echo(
+            f"warning: kiln server is {remote}; this client is {__version__}. "
+            "Restart it with `kiln server stop` and `kiln server start`.",
+            err=True,
+        )
+
+
+def _server_line(repo: Path) -> str:
+    if not is_running():
+        return "server  not running"
+    try:
+        info = Client().factory_status(repo)
+    except KilnError:
+        return "server  not running"
+    factory = info["factory"]
+    if factory["state"] == "running":
+        return f"server  running, factory running since {factory['started_at']}"
+    return "server  running, idle"
+
+
+_FOLLOW_PAGE = 100
+
+
+def _follow(client: Client, repo: Path, cursor: int) -> None:
+    while True:
+        page = client.events(repo, after=cursor, limit=_FOLLOW_PAGE)
+        events = page["events"]
+        for raw in events:
+            event = _event_from_payload(raw)
+            typer.echo(_format_event(event))
+            cursor = event.id
+        factory = page["factory"]
+        if factory["state"] == "running":
+            time.sleep(0.5)
+            continue
+        # A finished factory can still have more events than one page. Keep
+        # reading until a short page, which means the cursor has caught the tail.
+        if len(events) >= _FOLLOW_PAGE:
+            continue
+        _echo_outcome(factory)
+        if factory["state"] == "failed":
+            raise typer.Exit(code=1)
+        return
+
+
+def _print_factory_view(config: Config, info: dict, since: int | None) -> int:
+    factory = info["factory"]
+    if factory["state"] == "running":
+        typer.echo(f"factory  running since {factory['started_at']}")
+    elif factory["state"] == "idle":
+        typer.echo("factory  idle")
+    else:
+        detail = factory["state"]
+        if factory.get("stop_reason"):
+            detail += f" ({factory['stop_reason']})"
+        typer.echo(f"factory  {detail}")
+    typer.echo("\ngoals")
+    goals = info.get("goals") or []
+    if not goals:
+        typer.echo("  (none)")
+    for goal in goals:
+        typer.echo(f"  #{goal['id']}  {goal['status']}  {goal['title']}")
+    typer.echo("\nopen jobs")
+    jobs = info.get("open_jobs") or []
+    if not jobs:
+        typer.echo("  (none)")
+    for job in jobs:
+        typer.echo(f"  #{job['id']}  {job['status']:<9}  {job['role']}  {job['title']}")
+    typer.echo("\nevents")
+    return _print_backlog(config, since, following=factory["state"] == "running")
+
+
+def _print_backlog(config: Config, since: int | None, *, following: bool) -> int:
+    conn = connect(config.db_path)
+    try:
+        migrate(conn)
+        if since is None:
+            events = list_events(conn, limit=20)
+        else:
+            events = events_after(conn, since, limit=500)
+    finally:
+        conn.close()
+    for event in events:
+        typer.echo(_format_event(event))
+    if not events and not following:
+        typer.echo("(none)")
+    if events:
+        return events[-1].id
+    return 0 if since is None else since
+
+
+def _echo_outcome(factory: dict) -> None:
+    state = factory["state"]
+    if state == "completed":
+        typer.echo("factory completed")
+    elif state == "stopped":
+        typer.echo(f"factory stopped ({factory['stop_reason']})")
+    elif state == "failed":
+        typer.echo(f"factory failed: {factory['error']}")
+
+
+def _event_from_payload(raw: dict) -> Event:
+    return Event(
+        id=raw["id"],
+        ts=raw["ts"],
+        kind=raw["kind"],
+        job_id=raw["job_id"],
+        run_id=raw["run_id"],
+        message=raw["message"],
+    )
 
 
 def _fail(exc: KilnError) -> NoReturn:
