@@ -157,6 +157,7 @@ def add_job(
     now = utc_now()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        _validate_dependencies(conn, goal_id, deps)
         cur = conn.execute(
             """
             INSERT INTO jobs (
@@ -264,6 +265,16 @@ def dependents(conn: sqlite3.Connection, job_id: int) -> list[Job]:
         (job_id,),
     ).fetchall()
     return [Job.from_row(row) for row in rows]
+
+
+def _validate_dependencies(conn: sqlite3.Connection, goal_id: int, depends_on: list[int]) -> None:
+    """Reject the whole dependency list before a job row is inserted."""
+    if len(depends_on) != len(set(depends_on)):
+        raise KilnError("depends_on lists the same job more than once")
+    for dep_id in depends_on:
+        dep = require_job(conn, dep_id)
+        if dep.goal_id != goal_id:
+            raise KilnError(f"dependency #{dep_id} is in a different goal")
 
 
 def add_dependency(conn: sqlite3.Connection, job_id: int, depends_on: int) -> None:

@@ -365,9 +365,8 @@ def job_add(
             acceptance=acceptance,
             priority=priority,
             max_attempts=config.max_attempts,
+            depends_on=depends_on,
         )
-        for dep_id in depends_on or []:
-            add_dependency(conn, job.id, dep_id)
         typer.echo(f"job #{job.id}  {job.title}")
 
     _with_db(render)

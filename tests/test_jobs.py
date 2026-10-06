@@ -12,6 +12,7 @@ from kiln.jobs import (
     claim_job,
     claim_next,
     complete_job,
+    dependencies,
     list_jobs,
     ready_jobs,
     reject_job,
@@ -292,13 +293,20 @@ def test_diamond_dependencies_are_allowed(conn):
     add_dependency(conn, left.id, right.id)
 
 
-def test_add_job_rolls_back_when_a_dependency_is_rejected(conn):
+def test_add_job_leaves_no_job_when_a_dependency_is_rejected(conn):
     first = add_goal(conn, "One")
     second = add_goal(conn, "Two")
+    local = add_job(conn, first.id, "Local")
     foreign = add_job(conn, second.id, "Foreign")
-    with pytest.raises(KilnError, match="different goals"):
-        add_job(conn, first.id, "Local", depends_on=[foreign.id])
-    assert list_jobs(conn, goal_id=first.id) == []
+    with pytest.raises(KilnError, match="different goal"):
+        add_job(conn, first.id, "Blocked", depends_on=[local.id, foreign.id])
+    with pytest.raises(KilnError, match="no job with id 99"):
+        add_job(conn, first.id, "Missing", depends_on=[99])
+    with pytest.raises(KilnError, match="same job more than once"):
+        add_job(conn, first.id, "Dup", depends_on=[local.id, local.id])
+    assert [job.title for job in list_jobs(conn, goal_id=first.id)] == ["Local"]
+    ready = add_job(conn, first.id, "Ready", depends_on=[local.id])
+    assert [dep.id for dep in dependencies(conn, ready.id)] == [local.id]
 
 
 def test_dependency_must_share_a_goal(conn):

@@ -107,6 +107,19 @@ def test_goal_and_job_flow(repo):
     assert "cancelled #2" in cancelled.output
 
 
+def test_job_add_with_a_bad_dependency_leaves_no_job(repo):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["goal", "add", "Ship it"]).exit_code == 0
+    assert runner.invoke(app, ["job", "add", "1", "Schema"]).exit_code == 0
+    failed = runner.invoke(app, ["job", "add", "1", "CLI", "--depends-on", "1", "--depends-on", "99"])
+    assert failed.exit_code != 0
+    assert "no job with id 99" in failed.output
+    listed = runner.invoke(app, ["job", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "Schema" in listed.output
+    assert "CLI" not in listed.output
+
+
 def test_commands_require_init(repo):
     for args in (["status"], ["log"], ["gc"], ["runs", "show", "1"]):
         result = runner.invoke(app, args)
