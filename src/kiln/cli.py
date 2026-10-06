@@ -431,9 +431,10 @@ def goal_add(
 ) -> None:
     """Add a goal."""
 
-    def render(_config: Config, conn) -> None:
+    def render(config: Config, conn) -> None:
         goal = add_goal(conn, title, description)
         typer.echo(f"goal #{goal.id}  {goal.title}")
+        _hand_goal_to_running_server(config)
 
     _with_db(render)
 
@@ -601,6 +602,21 @@ def _with_db(fn: Callable, *, mutates_lifecycle: bool = False) -> None:
         _fail(exc)
     finally:
         conn.close()
+
+
+def _hand_goal_to_running_server(config: Config) -> None:
+    """If the server is up, ask it to include this goal in the factory.
+
+    A running factory takes another pass before it marks itself completed. If the
+    previous run has already finished, this starts the next one. A server that is
+    not running is left alone; `kiln run` picks the goal up later.
+    """
+    if not is_running():
+        return
+    try:
+        Client().start_factory(config.repo_root, agent_bin=os.environ.get("KILN_AGENT_BIN"))
+    except KilnError:
+        return
 
 
 def _refuse_if_factory_running(config: Config) -> None:

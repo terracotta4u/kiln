@@ -75,7 +75,7 @@ kiln job cancel
 kiln gc
 ```
 
-`kiln goal add` still works. The running factory picks the new goal up on a later turn. `kiln status`, `kiln log`, `kiln goal show`, `kiln job list`, and `kiln runs show` read the database directly and do not need the server. `kiln status` also says whether the server is up and whether a factory is running for this repository.
+`kiln goal add` still works. When the server is already running, the new goal is handed to it: a factory in progress takes another pass before it can mark itself completed, and a finished one starts again. When the server is not running, the goal waits for `kiln run`. `kiln status`, `kiln log`, `kiln goal show`, `kiln job list`, and `kiln runs show` read the database directly and do not need the server. `kiln status` also says whether the server is up and whether a factory is running for this repository.
 
 ## Looking around
 

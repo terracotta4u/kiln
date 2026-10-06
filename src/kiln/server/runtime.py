@@ -37,6 +37,7 @@ class Factory:
     turns: int | None
     stop_event: threading.Event
     thread: threading.Thread | None = None
+    rerun_requested: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -67,8 +68,10 @@ class FactoryRuntime:
     ) -> tuple[Factory, bool, int]:
         """Start the factory for repo. Returns the factory, whether this call started it, and an event cursor.
 
-        A second start while the same repo is already running returns the existing factory.
-        The cursor is the last event id from before this run, so a client can stream exactly it.
+        A second start while the same repo is already running returns the existing factory
+        and asks it to take another pass before it marks itself completed. That is how a goal
+        added at the exit of a run is not left behind. The cursor is the last event id from
+        before this run, so a client can stream exactly it.
         """
         repo = repo.resolve()
         cursor = _cursor(repo)
@@ -77,6 +80,7 @@ class FactoryRuntime:
                 raise KilnError("server is shutting down")
             current = self._factories.get(repo)
             if current is not None and current.state == RUNNING:
+                current.rerun_requested = True
                 return current, False, _cursor(repo)
             factory = Factory(
                 repo_root=repo,
@@ -138,25 +142,33 @@ class FactoryRuntime:
             conn = connect(config.db_path)
             migrate(conn)
             record_event(conn, "factory.started", f"factory started for {factory.repo_root}")
-            result = run_until_done(
-                conn,
-                config,
-                workers=factory.workers,
-                turns=factory.turns,
-                agent_bin=agent_bin,
-                reporter=lambda line: _persist_line(config.db_path, line),
-                should_stop=factory.stop_event.is_set,
-            )
-            if result.stop_reason is None:
-                record_event(conn, "factory.completed", "factory completed")
-                self._finish(factory, COMPLETED, None, None)
-            else:
-                record_event(
+            while True:
+                result = run_until_done(
                     conn,
-                    "factory.stopped",
-                    f"factory stopped ({result.stop_reason})",
+                    config,
+                    workers=factory.workers,
+                    turns=factory.turns,
+                    agent_bin=agent_bin,
+                    reporter=lambda line: _persist_line(config.db_path, line),
+                    should_stop=factory.stop_event.is_set,
                 )
-                self._finish(factory, STOPPED, result.stop_reason, None)
+                # The rerun flag and the terminal state change under one lock, so a
+                # start_factory that arrives as this pass returns cannot be missed.
+                with self._lock:
+                    if result.stop_reason is None and factory.rerun_requested:
+                        factory.rerun_requested = False
+                        continue
+                    if result.stop_reason is None:
+                        record_event(conn, "factory.completed", "factory completed")
+                        self._publish(factory, COMPLETED, None, None)
+                    else:
+                        record_event(
+                            conn,
+                            "factory.stopped",
+                            f"factory stopped ({result.stop_reason})",
+                        )
+                        self._publish(factory, STOPPED, result.stop_reason, None)
+                    break
         except Exception as exc:
             if conn is not None:
                 try:
@@ -176,10 +188,20 @@ class FactoryRuntime:
         error: str | None,
     ) -> None:
         with self._lock:
-            factory.state = state
-            factory.stop_reason = stop_reason
-            factory.error = error
-            factory.finished_at = utc_now()
+            self._publish(factory, state, stop_reason, error)
+
+    def _publish(
+        self,
+        factory: Factory,
+        state: str,
+        stop_reason: str | None,
+        error: str | None,
+    ) -> None:
+        factory.state = state
+        factory.stop_reason = stop_reason
+        factory.error = error
+        factory.finished_at = utc_now()
+        factory.rerun_requested = False
 
 
 def factory_payload(factory: Factory | None, repo: Path) -> dict:

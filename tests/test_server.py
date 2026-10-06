@@ -24,6 +24,7 @@ from kiln.notes import list_notes
 from kiln.server.client import Client, ensure_running, is_running
 from kiln.server.paths import log_path, pid_path, socket_path
 from kiln.server.runtime import FactoryRuntime
+from kiln.tick import TickResult
 
 runner = CliRunner()
 
@@ -163,6 +164,67 @@ def test_a_raised_loop_is_failed(factory: Path, monkeypatch: pytest.MonkeyPatch)
     assert running.state == "failed"
     assert running.error == "boom"
     assert any(event.kind == "factory.failed" for event in _events(factory))
+
+
+def test_a_goal_added_as_the_run_returns_is_taken_on_another_pass(
+    factory: Path, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fake_run(*_args, **_kwargs) -> TickResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            assert release.wait(5)
+        return TickResult()
+
+    monkeypatch.setattr("kiln.server.runtime.run_until_done", fake_run)
+    runtime = FactoryRuntime()
+    running, started, _cursor = runtime.start(factory, turns=1)
+    assert started
+    assert entered.wait(5)
+    again, started_again, _again = runtime.start(factory, turns=1)
+    assert started_again is False
+    assert again is running
+    release.set()
+    assert running.thread is not None
+    running.thread.join(5)
+
+    assert calls["n"] == 2
+    assert running.state == "completed"
+
+
+def test_a_stopped_run_does_not_start_another_pass_for_a_new_goal(
+    factory: Path, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fake_run(*_args, **_kwargs) -> TickResult:
+        calls["n"] += 1
+        entered.set()
+        assert release.wait(5)
+        result = TickResult()
+        result.stop_reason = "turn_limit"
+        return result
+
+    monkeypatch.setattr("kiln.server.runtime.run_until_done", fake_run)
+    runtime = FactoryRuntime()
+    running, started, _cursor = runtime.start(factory, turns=1)
+    assert started
+    assert entered.wait(5)
+    _again, started_again, _cursor_again = runtime.start(factory, turns=1)
+    assert started_again is False
+    release.set()
+    assert running.thread is not None
+    running.thread.join(5)
+
+    assert calls["n"] == 1
+    assert running.state == "stopped"
+    assert running.stop_reason == "turn_limit"
 
 
 def test_attach_shows_the_factory_another_client_started(factory: Path):
