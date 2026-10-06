@@ -2,7 +2,7 @@
 
 Kiln is a software factory for one git repository. You give it a goal. A foreman decides what happens next: create a job, dispatch it, or approve, rework, or reject a worker branch. A job has a role. Workers edit code, each in its own git worktree and branch. Scouts and reviewers are read-only. The foreman decides the process. Kiln runs the job and keeps the invariants.
 
-Kiln drives the Cursor CLI (`agent`). `kiln run` keeps working until the goal is finished, then opens one pull request.
+Kiln drives the Cursor CLI (`agent`). A Kiln server on this machine owns the factory. `kiln run` asks that server to work until the goal is finished, then Kiln opens one pull request. Closing the terminal does not stop the factory.
 
 ## Setup
 
@@ -29,7 +29,9 @@ kiln goal add "Add a health check" --description "GET /health returns 200"
 kiln run
 ```
 
-`kiln run` creates a branch for the goal (`kiln/goal-<id>-<slug>`). The foreman creates jobs and dispatches them. Each approved worker is merged onto that goal branch. When nothing is left to do, Kiln pushes the branch to `origin` and opens one pull request into `base_branch`. The pull request includes the brief and the evidence.
+`kiln run` asks the server to run this repository. It creates a branch for the goal (`kiln/goal-<id>-<slug>`). The foreman creates jobs and dispatches them. Each approved worker is merged onto that goal branch. When nothing is left to do, Kiln pushes the branch to `origin` and opens one pull request into `base_branch`. The pull request includes the brief and the evidence.
+
+Ctrl-C detaches and leaves the factory running. `kiln attach` reconnects and shows the goals, the open jobs, recent events, and new events as they are written. `kiln attach --since 40` starts at that event id.
 
 A scout or reviewer is ready when it is pending and every dependency is completed. A worker is ready when it is pending, every dependency is completed, and every worker it depends on is merged. A rejected worker does not unblock jobs that depend on it.
 
@@ -39,7 +41,41 @@ The repository needs an `origin` remote and the GitHub CLI (`gh`) so the pull re
 kiln run --dry-run      # print the state the foreman would see; change nothing
 kiln run --turns 1      # one foreman turn, then stop
 kiln run --workers 1    # cap how many agents a turn runs at once
+kiln attach             # reconnect to a factory that is already running
 ```
+
+`--dry-run` does not use the server and changes nothing. A second `kiln run` while a factory is already running attaches to that factory instead of starting another one.
+
+A run ends in one of three ways. `completed` means no active goals remain. `stopped` means the loop ended with work still open: the turn cap (`turn_limit`), two foreman failures (`foreman_failures`), a turn that changed nothing (`no_progress`), or the server shutting down (`server_shutdown`). `failed` means the runtime itself raised. `kiln run` exits 1 only in that last case.
+
+## The server
+
+One server runs per machine. It is the runtime. Each repository keeps its own `.kiln/` database, and that database remains the record of goals, jobs, runs, and events. The server only remembers which factories it is currently running. If the server process dies, that memory is gone and the work stops with it. Kiln does not resume an interrupted factory yet. Start the server again and run `kiln run`; goals and jobs are still in the database. A job left `running` is not reconciled yet.
+
+```bash
+kiln server start     # background. Harmless if one is already running.
+kiln server status    # running, or not running
+kiln server stop      # refuses while a factory is running
+kiln server stop --force
+```
+
+`stop --force` asks each loop to stop, kills agents that are still running, waits for the factory threads, and exits. A thread that has not finished by then is abandoned and the process exits anyway. SIGTERM and SIGINT to the server do the same thing. The factory is recorded as stopped with reason `server_shutdown`. An agent killed mid-job fails that attempt the way a crashed agent already does.
+
+`~/.kiln/` holds the socket, the pid file, and the server log. `KILN_HOME` overrides that directory. Restart the server after upgrading Kiln. A newer client warns when it is talking to an older server.
+
+While a factory is running, the server owns job lifecycle for that repository. These commands refuse, and tell you to attach, wait, or `kiln server stop --force`:
+
+```bash
+kiln work
+kiln scout
+kiln review
+kiln job add
+kiln job dep
+kiln job cancel
+kiln gc
+```
+
+`kiln goal add` still works. The running factory picks the new goal up on a later turn. `kiln status`, `kiln log`, `kiln goal show`, `kiln job list`, and `kiln runs show` read the database directly and do not need the server. `kiln status` also says whether the server is up and whether a factory is running for this repository.
 
 ## Looking around
 
@@ -55,7 +91,7 @@ kiln runs show 3    # model, report, and the tail of the agent log
 
 ## Human overrides
 
-The foreman creates the job graph. These commands are the escape hatch:
+The foreman creates the job graph. These commands are the escape hatch. They refuse while a factory is running for this repository, because the server owns job lifecycle then:
 
 ```bash
 kiln job add 1 "Write the handler" --acceptance "pytest passes" --priority 1
@@ -81,7 +117,7 @@ kiln gc
 
 ## What a run does
 
-`kiln run` repeats a turn until every active goal is finished. Each turn asks the foreman once. The state it sees includes the brief, the turn number, each job's role, whether it is ready or blocked, a worker's integration, a reviewer's target, and the current result summary and evidence. It does not include the diff.
+The server repeats a turn until every active goal is finished. `kiln run` asks it to, then follows the event log. Each turn asks the foreman once. The state it sees includes the brief, the turn number, each job's role, whether it is ready or blocked, a worker's integration, a reviewer's target, and the current result summary and evidence. It does not include the diff.
 
 1. Remove leftover worktrees from finished jobs.
 2. Create the goal branch from `base_branch` if it does not exist yet.
@@ -118,7 +154,7 @@ A job that has used `max_attempts` cannot be reworked. It stays completed so the
 | `base_branch` | Branch the pull request targets. `kiln init` uses the current branch. |
 | `verify` | Shell command run in the worktree after a worker commits. Empty skips it. |
 | `max_parallel_workers` | How many dispatches one turn may run at once. Default 2. |
-| `max_foreman_turns` | How many foreman turns one run may take. Default 25. |
+| `max_foreman_turns` | How many foreman turns one factory run may take. Default 25. |
 | `max_attempts` | Attempts before rework is refused. Default 3. |
 | `delete_merged_branches` | Delete a worker branch after it merges into the goal branch. Default true. The goal branch stays. |
 | `models.foreman` | Model that decides what happens each turn. |
